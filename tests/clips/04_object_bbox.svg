@@ -1,0 +1,8 @@
+<svg width="200" height="160" viewBox="0 0 200 160" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="bbox-clip" clipPathUnits="objectBoundingBox">
+      <circle cx="0.5" cy="0.5" r="0.45"/>
+    </clipPath>
+  </defs>
+  <rect x="30" y="35" width="140" height="90" fill="#238b57" clip-path="url(#bbox-clip)"/>
+</svg>

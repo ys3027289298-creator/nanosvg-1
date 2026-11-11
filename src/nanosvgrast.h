@@ -85,6 +85,7 @@ void nsvgDeleteRasterizer(NSVGrasterizer*);
 #define NSVG__FIX			(1 << NSVG__FIXSHIFT)
 #define NSVG__FIXMASK		(NSVG__FIX-1)
 #define NSVG__MEMPAGE_SIZE	1024
+#define NSVG__MAX_CLIP_DEPTH 16
 
 typedef struct NSVGedge {
 	float x0,y0, x1,y1;
@@ -106,6 +107,24 @@ typedef struct NSVGactiveEdge {
 	int dir;
 	struct NSVGactiveEdge *next;
 } NSVGactiveEdge;
+
+enum NSVGclipNodeType {
+	NSVG_CLIPNODE_PATH = 0,
+	NSVG_CLIPNODE_UNION = 1,
+	NSVG_CLIPNODE_INTERSECT = 2
+};
+
+typedef struct NSVGclipNode {
+	char type;
+	char fillRule;
+	NSVGedge* edges;
+	int nedges;
+	int cedges;
+	int edgeIndex;
+	NSVGactiveEdge* active;
+	struct NSVGclipNode* children;
+	struct NSVGclipNode* next;
+} NSVGclipNode;
 
 typedef struct NSVGmemPage {
 	unsigned char mem[NSVG__MEMPAGE_SIZE];
@@ -146,8 +165,14 @@ struct NSVGrasterizer
 	unsigned char* scanline;
 	int cscanline;
 
+	unsigned char* clipScanline;
+	unsigned char* clipScratch[NSVG__MAX_CLIP_DEPTH];
+	int cclipScanline;
+	NSVGclipNode* clipRoot;
+
 	unsigned char* bitmap;
 	int width, height, stride;
+	NSVGimage* image;
 };
 
 NSVGrasterizer* nsvgCreateRasterizer(void)
@@ -183,6 +208,12 @@ void nsvgDeleteRasterizer(NSVGrasterizer* r)
 	if (r->points) free(r->points);
 	if (r->points2) free(r->points2);
 	if (r->scanline) free(r->scanline);
+	if (r->clipScanline) free(r->clipScanline);
+	{
+		int i;
+		for (i = 0; i < NSVG__MAX_CLIP_DEPTH; i++)
+			if (r->clipScratch[i]) free(r->clipScratch[i]);
+	}
 
 	free(r);
 }
@@ -957,6 +988,451 @@ static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEd
 	}
 }
 
+static void nsvgrast__xformPoint(float* dx, float* dy, float x, float y, float* t)
+{
+	*dx = x*t[0] + y*t[2] + t[4];
+	*dy = x*t[1] + y*t[3] + t[5];
+}
+
+static void nsvgrast__xformInverse(float* inv, float* t)
+{
+	double det = (double)t[0] * t[3] - (double)t[2] * t[1];
+	if (det > -1e-6 && det < 1e-6) {
+		inv[0] = 1.0f; inv[1] = 0.0f;
+		inv[2] = 0.0f; inv[3] = 1.0f;
+		inv[4] = 0.0f; inv[5] = 0.0f;
+		return;
+	}
+	{
+		double id = 1.0 / det;
+		inv[0] = (float)(t[3] * id);
+		inv[2] = (float)(-t[2] * id);
+		inv[4] = (float)(((double)t[2] * t[5] - (double)t[3] * t[4]) * id);
+		inv[1] = (float)(-t[1] * id);
+		inv[3] = (float)(t[0] * id);
+		inv[5] = (float)(((double)t[1] * t[4] - (double)t[0] * t[5]) * id);
+	}
+}
+
+static void nsvgrast__xformMultiply(float* t, float* s)
+{
+	float t0 = t[0] * s[0] + t[1] * s[2];
+	float t2 = t[2] * s[0] + t[3] * s[2];
+	float t4 = t[4] * s[0] + t[5] * s[2] + s[4];
+	t[1] = t[0] * s[1] + t[1] * s[3];
+	t[3] = t[2] * s[1] + t[3] * s[3];
+	t[5] = t[4] * s[1] + t[5] * s[3] + s[5];
+	t[0] = t0;
+	t[2] = t2;
+	t[4] = t4;
+}
+
+static NSVGclipNode* nsvgrast__newClipNode(char type)
+{
+	NSVGclipNode* node = (NSVGclipNode*)malloc(sizeof(NSVGclipNode));
+	if (node == NULL) return NULL;
+	memset(node, 0, sizeof(NSVGclipNode));
+	node->type = type;
+	return node;
+}
+
+static void nsvgrast__appendClipNode(NSVGclipNode* parent, NSVGclipNode* child)
+{
+	if (child == NULL) return;
+	if (parent->children == NULL) {
+		parent->children = child;
+	} else {
+		NSVGclipNode* tail = parent->children;
+		while (tail->next) tail = tail->next;
+		tail->next = child;
+	}
+}
+
+static void nsvgrast__deleteClipTree(NSVGclipNode* node)
+{
+	if (node == NULL) return;
+	{
+		NSVGclipNode* child = node->children;
+		while (child) {
+			NSVGclipNode* next = child->next;
+			nsvgrast__deleteClipTree(child);
+			child = next;
+		}
+	}
+	free(node->edges);
+	free(node);
+}
+
+static void nsvgrast__resetClipState(NSVGclipNode* node)
+{
+	while (node) {
+		node->active = NULL;
+		node->edgeIndex = 0;
+		nsvgrast__resetClipState(node->children);
+		node = node->next;
+	}
+}
+
+static void nsvgrast__addClipEdge(NSVGclipNode* node, float x0, float y0, float x1, float y1)
+{
+	NSVGedge* e;
+	if (y0 == y1) return;
+	if (node->nedges + 1 > node->cedges) {
+		int c = node->cedges > 0 ? node->cedges * 2 : 64;
+		NSVGedge* edges = (NSVGedge*)realloc(node->edges, sizeof(NSVGedge) * c);
+		if (edges == NULL) return;
+		node->edges = edges;
+		node->cedges = c;
+	}
+	e = &node->edges[node->nedges++];
+	if (y0 < y1) {
+		e->x0 = x0; e->y0 = y0; e->x1 = x1; e->y1 = y1; e->dir = 1;
+	} else {
+		e->x0 = x1; e->y0 = y1; e->x1 = x0; e->y1 = y0; e->dir = -1;
+	}
+}
+
+static void nsvgrast__clipLocalBounds(float* bounds, NSVGshape* shape, NSVGclipRef* ref,
+									  NSVGimage* image, float* xform)
+{
+	NSVGshape* s;
+	int found = 0;
+	bounds[0] = bounds[1] = 1e30f;
+	bounds[2] = bounds[3] = -1e30f;
+	for (s = image != NULL ? image->shapes : NULL; s != NULL; s = s->next) {
+		NSVGclipRef* r;
+		for (r = s->clipRefs; r != NULL; r = r->next) {
+			if (ref->scope != 0 && r->scope == ref->scope && r->clip == ref->clip) {
+				float inv[6], x, y;
+				int i;
+				nsvgrast__xformInverse(inv, r->xform);
+				for (i = 0; i < 4; i++) {
+					float px = s->bounds[(i & 1) ? 2 : 0];
+					float py = s->bounds[(i & 2) ? 3 : 1];
+					nsvgrast__xformPoint(&x, &y, px, py, inv);
+					bounds[0] = x < bounds[0] ? x : bounds[0];
+					bounds[1] = y < bounds[1] ? y : bounds[1];
+					bounds[2] = x > bounds[2] ? x : bounds[2];
+					bounds[3] = y > bounds[3] ? y : bounds[3];
+				}
+				found = 1;
+			}
+		}
+	}
+	if (!found) {
+		float inv[6], x, y;
+		int i;
+		nsvgrast__xformInverse(inv, xform);
+		for (i = 0; i < 4; i++) {
+			float px = shape->bounds[(i & 1) ? 2 : 0];
+			float py = shape->bounds[(i & 2) ? 3 : 1];
+			nsvgrast__xformPoint(&x, &y, px, py, inv);
+			bounds[0] = x < bounds[0] ? x : bounds[0];
+			bounds[1] = y < bounds[1] ? y : bounds[1];
+			bounds[2] = x > bounds[2] ? x : bounds[2];
+			bounds[3] = y > bounds[3] ? y : bounds[3];
+		}
+	}
+}
+
+static void nsvgrast__flattenClipPath(NSVGrasterizer* r, NSVGclipNode* node, NSVGpath* path,
+									  NSVGclip* clip, float* xform, float* localBounds,
+									  float scale, float tx, float ty)
+{
+	float bminx = 0, bminy = 0, bw = 0, bh = 0;
+	float x, y;
+	int i, j;
+
+	if (clip->units == NSVG_CLIP_OBJECT_SPACE) {
+		bminx = localBounds[0];
+		bminy = localBounds[1];
+		bw = localBounds[2] - localBounds[0];
+		bh = localBounds[3] - localBounds[1];
+	}
+
+	r->npoints = 0;
+	if (clip->units == NSVG_CLIP_OBJECT_SPACE) {
+		float px = bminx + path->pts[0] * bw;
+		float py = bminy + path->pts[1] * bh;
+		nsvgrast__xformPoint(&x, &y, px, py, xform);
+	} else {
+		nsvgrast__xformPoint(&x, &y, path->pts[0], path->pts[1], xform);
+	}
+	nsvg__addPathPoint(r, x*scale, y*scale, 0);
+	for (i = 0; i < path->npts-1; i += 3) {
+		float cx[4], cy[4];
+		for (j = 0; j < 4; j++) {
+			float px = path->pts[(i+j)*2];
+			float py = path->pts[(i+j)*2+1];
+			if (clip->units == NSVG_CLIP_OBJECT_SPACE) {
+				px = bminx + px * bw;
+				py = bminy + py * bh;
+			}
+			nsvgrast__xformPoint(&cx[j], &cy[j], px, py, xform);
+			cx[j] *= scale;
+			cy[j] *= scale;
+		}
+		nsvg__flattenCubicBez(r, cx[0],cy[0], cx[1],cy[1], cx[2],cy[2], cx[3],cy[3], 0, 0);
+	}
+	if (clip->units == NSVG_CLIP_OBJECT_SPACE) {
+		float px = bminx + path->pts[0] * bw;
+		float py = bminy + path->pts[1] * bh;
+		nsvgrast__xformPoint(&x, &y, px, py, xform);
+	} else {
+		nsvgrast__xformPoint(&x, &y, path->pts[0], path->pts[1], xform);
+	}
+	nsvg__addPathPoint(r, x*scale, y*scale, 0);
+	for (i = 0, j = r->npoints-1; i < r->npoints; j = i++)
+		nsvgrast__addClipEdge(node, tx + r->points[j].x, (ty + r->points[j].y) * NSVG__SUBSAMPLES,
+									tx + r->points[i].x, (ty + r->points[i].y) * NSVG__SUBSAMPLES);
+}
+
+static NSVGclipNode* nsvgrast__compileClip(NSVGrasterizer* r, NSVGclip* clip, NSVGshape* shape,
+										   float scale, float* xform, float* localBounds, float tx, float ty,
+										   NSVGclip** stack, int depth);
+
+static NSVGclipNode* nsvgrast__compileClipRefs(NSVGrasterizer* r, NSVGclipRef* refs, NSVGshape* shape,
+											   float scale, float* parentXform, float tx, float ty,
+											   NSVGclip** stack, int depth)
+{
+	NSVGclipNode* root = NULL;
+	NSVGclipRef* ref;
+	int count = 0;
+
+	for (ref = refs; ref != NULL; ref = ref->next) {
+		NSVGclipRef* prev;
+		int duplicate = 0;
+		if (ref->clip == NULL) continue;
+		for (prev = refs; prev != ref; prev = prev->next)
+			if (prev->clip == ref->clip && prev->scope == ref->scope) duplicate = 1;
+		if (!duplicate) count++;
+	}
+	if (count == 0) return NULL;
+
+	if (count == 1) {
+		for (ref = refs; ref != NULL; ref = ref->next) {
+			NSVGclipRef* prev;
+			int duplicate = 0;
+			if (ref->clip == NULL) continue;
+			for (prev = refs; prev != ref; prev = prev->next)
+				if (prev->clip == ref->clip && prev->scope == ref->scope) duplicate = 1;
+			if (!duplicate) {
+				float eff[6];
+				float bounds[4];
+				float* localBounds = NULL;
+				memcpy(eff, ref->xform, sizeof(eff));
+				if (parentXform != NULL)
+					nsvgrast__xformMultiply(eff, parentXform);
+				if (ref->clip->units == NSVG_CLIP_OBJECT_SPACE) {
+					nsvgrast__clipLocalBounds(bounds, shape, ref, r->image, eff);
+					localBounds = bounds;
+				}
+				return nsvgrast__compileClip(r, ref->clip, shape, scale, eff, localBounds, tx, ty, stack, depth);
+			}
+		}
+	}
+
+	root = nsvgrast__newClipNode(NSVG_CLIPNODE_INTERSECT);
+	if (root == NULL) return NULL;
+	for (ref = refs; ref != NULL; ref = ref->next) {
+		NSVGclipRef* prev;
+		NSVGclipNode* child;
+		float eff[6];
+		float bounds[4];
+		float* localBounds = NULL;
+		int duplicate = 0;
+		if (ref->clip == NULL) continue;
+		for (prev = refs; prev != ref; prev = prev->next)
+			if (prev->clip == ref->clip && prev->scope == ref->scope) duplicate = 1;
+		if (duplicate) continue;
+		if (parentXform != NULL) {
+			memcpy(eff, ref->xform, sizeof(eff));
+			nsvgrast__xformMultiply(eff, parentXform);
+		} else {
+			memcpy(eff, ref->xform, sizeof(eff));
+		}
+		if (ref->clip->units == NSVG_CLIP_OBJECT_SPACE) {
+			nsvgrast__clipLocalBounds(bounds, shape, ref, r->image, eff);
+			localBounds = bounds;
+		}
+		child = nsvgrast__compileClip(r, ref->clip, shape, scale, eff, localBounds, tx, ty, stack, depth);
+		nsvgrast__appendClipNode(root, child);
+	}
+	return root;
+}
+
+static NSVGclipNode* nsvgrast__compileClip(NSVGrasterizer* r, NSVGclip* clip, NSVGshape* shape,
+										   float scale, float* xform, float* localBounds, float tx, float ty,
+										   NSVGclip** stack, int depth)
+{
+	NSVGclipNode* root;
+	NSVGclipNode* unionNode;
+	NSVGclipPath* path;
+	int i, cycle = 0;
+
+	if (clip == NULL || depth >= NSVG__MAX_CLIP_DEPTH) return NULL;
+	for (i = 0; i < depth; i++)
+		if (stack[i] == clip) cycle = 1;
+	if (cycle) return NULL;
+	stack[depth] = clip;
+
+	unionNode = nsvgrast__newClipNode(NSVG_CLIPNODE_UNION);
+	if (unionNode == NULL) return NULL;
+
+	for (path = clip->paths; path != NULL; path = path->next) {
+		NSVGclipNode* pathNode = nsvgrast__newClipNode(NSVG_CLIPNODE_PATH);
+		NSVGclipNode* refsNode;
+		NSVGpath* subpath;
+		if (pathNode == NULL) continue;
+		pathNode->fillRule = path->fillRule;
+		for (subpath = path->paths; subpath != NULL; subpath = subpath->next)
+			nsvgrast__flattenClipPath(r, pathNode, subpath, clip, xform, localBounds, scale, tx, ty);
+		if (pathNode->nedges > 0)
+			qsort(pathNode->edges, pathNode->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
+		refsNode = nsvgrast__compileClipRefs(r, path->clipRefs, shape, scale, xform, tx, ty, stack, depth+1);
+		if (refsNode != NULL) {
+			NSVGclipNode* intersect = nsvgrast__newClipNode(NSVG_CLIPNODE_INTERSECT);
+			if (intersect != NULL) {
+				nsvgrast__appendClipNode(intersect, pathNode);
+				nsvgrast__appendClipNode(intersect, refsNode);
+				pathNode = intersect;
+			}
+		}
+		nsvgrast__appendClipNode(unionNode, pathNode);
+	}
+
+	root = unionNode;
+	if (clip->clipRefs != NULL) {
+		NSVGclipNode* refsNode = nsvgrast__compileClipRefs(r, clip->clipRefs, shape, scale, xform, tx, ty, stack, depth+1);
+		if (refsNode != NULL) {
+			NSVGclipNode* intersect = nsvgrast__newClipNode(NSVG_CLIPNODE_INTERSECT);
+			if (intersect != NULL) {
+				nsvgrast__appendClipNode(intersect, unionNode);
+				nsvgrast__appendClipNode(intersect, refsNode);
+				root = intersect;
+			}
+		}
+	}
+	return root;
+}
+
+static unsigned char* nsvgrast__clipScratch(NSVGrasterizer* r, int depth)
+{
+	if (depth < NSVG__MAX_CLIP_DEPTH)
+		return r->clipScratch[depth];
+	return NULL;
+}
+
+static void nsvgrast__rasterizeClipPath(NSVGrasterizer* r, NSVGclipNode* node, int y, unsigned char* dst)
+{
+	NSVGactiveEdge* active = node->active;
+	int e = node->edgeIndex;
+	int s;
+	int maxWeight = (255 / NSVG__SUBSAMPLES);
+
+	memset(dst, 0, r->width);
+	for (s = 0; s < NSVG__SUBSAMPLES; ++s) {
+		float scany = (float)(y*NSVG__SUBSAMPLES + s) + 0.5f;
+		NSVGactiveEdge **step = &active;
+		int xmin = r->width, xmax = 0;
+
+		while (*step) {
+			NSVGactiveEdge *z = *step;
+			if (z->ey <= scany) {
+				*step = z->next;
+				nsvg__freeActive(r, z);
+			} else {
+				z->x += z->dx;
+				step = &((*step)->next);
+			}
+		}
+		for (;;) {
+			int changed = 0;
+			step = &active;
+			while (*step && (*step)->next) {
+				if ((*step)->x > (*step)->next->x) {
+					NSVGactiveEdge* t = *step;
+					NSVGactiveEdge* q = t->next;
+					t->next = q->next;
+					q->next = t;
+					*step = q;
+					changed = 1;
+				}
+				step = &(*step)->next;
+			}
+			if (!changed) break;
+		}
+		while (e < node->nedges && node->edges[e].y0 <= scany) {
+			if (node->edges[e].y1 > scany) {
+				NSVGactiveEdge* z = nsvg__addActive(r, &node->edges[e], scany);
+				if (z == NULL) break;
+				if (active == NULL) {
+					active = z;
+				} else if (z->x < active->x) {
+					z->next = active;
+					active = z;
+				} else {
+					NSVGactiveEdge* p = active;
+					while (p->next && p->next->x < z->x)
+						p = p->next;
+					z->next = p->next;
+					p->next = z;
+				}
+			}
+			e++;
+		}
+		if (active != NULL)
+			nsvg__fillActiveEdges(dst, r->width, active, maxWeight, &xmin, &xmax, node->fillRule);
+	}
+	node->active = active;
+	node->edgeIndex = e;
+}
+
+static void nsvgrast__evalClipNode(NSVGrasterizer* r, NSVGclipNode* node, int y,
+								   unsigned char* dst, int depth)
+{
+	if (node == NULL || depth >= NSVG__MAX_CLIP_DEPTH) {
+		memset(dst, 0, r->width);
+		return;
+	}
+	if (node->type == NSVG_CLIPNODE_PATH) {
+		nsvgrast__rasterizeClipPath(r, node, y, dst);
+	} else if (node->type == NSVG_CLIPNODE_UNION) {
+		NSVGclipNode* child = node->children;
+		int x;
+		if (child == NULL) {
+			memset(dst, 0, r->width);
+			return;
+		}
+		nsvgrast__evalClipNode(r, child, y, dst, depth+1);
+		for (child = child->next; child != NULL; child = child->next) {
+			unsigned char* scratch = nsvgrast__clipScratch(r, depth+1);
+			if (scratch == NULL) continue;
+			nsvgrast__evalClipNode(r, child, y, scratch, depth+1);
+			for (x = 0; x < r->width; x++)
+				if (scratch[x] > dst[x]) dst[x] = scratch[x];
+		}
+	} else if (node->type == NSVG_CLIPNODE_INTERSECT) {
+		NSVGclipNode* child = node->children;
+		int x;
+		if (child == NULL) {
+			memset(dst, 0, r->width);
+			return;
+		}
+		nsvgrast__evalClipNode(r, child, y, dst, depth+1);
+		for (child = child->next; child != NULL; child = child->next) {
+			unsigned char* scratch = nsvgrast__clipScratch(r, depth+1);
+			if (scratch == NULL) {
+				memset(dst, 0, r->width);
+				break;
+			}
+			nsvgrast__evalClipNode(r, child, y, scratch, depth+1);
+			for (x = 0; x < r->width; x++)
+				dst[x] = (unsigned char)(((int)dst[x] * (int)scratch[x] + 127) / 255);
+		}
+	}
+}
+
 static float nsvg__clampf(float a, float mn, float mx) {
 	if (isnan(a))
 		return mn;
@@ -1121,7 +1597,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 	}
 }
 
-static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule)
+static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule, NSVGclipNode* clipRoot)
 {
 	NSVGactiveEdge *active = NULL;
 	int y, s;
@@ -1199,10 +1675,17 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 			if (active != NULL)
 				nsvg__fillActiveEdges(r->scanline, r->width, active, maxWeight, &xmin, &xmax, fillRule);
 		}
+		if (clipRoot != NULL)
+			nsvgrast__evalClipNode(r, clipRoot, y, r->clipScanline, 0);
 		// Blit
 		if (xmin < 0) xmin = 0;
 		if (xmax > r->width-1) xmax = r->width-1;
 		if (xmin <= xmax) {
+			if (clipRoot != NULL) {
+				int i;
+				for (i = xmin; i <= xmax; i++)
+					r->scanline[i] = (unsigned char)(((int)r->scanline[i] * (int)r->clipScanline[i] + 127) / 255);
+			}
 			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
 		}
 	}
@@ -1387,19 +1870,33 @@ void nsvgRasterize(NSVGrasterizer* r,
 	r->width = w;
 	r->height = h;
 	r->stride = stride;
+	r->image = image;
 
 	if (w > r->cscanline) {
 		r->cscanline = w;
 		r->scanline = (unsigned char*)realloc(r->scanline, w);
 		if (r->scanline == NULL) return;
 	}
+	if (w > r->cclipScanline) {
+		int j;
+		r->cclipScanline = w;
+		r->clipScanline = (unsigned char*)realloc(r->clipScanline, w);
+		if (r->clipScanline == NULL) return;
+		for (j = 0; j < NSVG__MAX_CLIP_DEPTH; j++) {
+			r->clipScratch[j] = (unsigned char*)realloc(r->clipScratch[j], w);
+			if (r->clipScratch[j] == NULL) return;
+		}
+	}
 
 	for (i = 0; i < h; i++)
 		memset(&dst[i*stride], 0, w*4);
 
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		NSVGclip* clipStack[NSVG__MAX_CLIP_DEPTH];
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
+
+		r->clipRoot = nsvgrast__compileClipRefs(r, shape->clipRefs, shape, scale, NULL, tx, ty, clipStack, 0);
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1408,6 +1905,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                 nsvg__resetPool(r);
                 r->freelist = NULL;
                 r->nedges = 0;
+                nsvgrast__resetClipState(r->clipRoot);
 
                 nsvg__flattenShape(r, shape, scale);
 
@@ -1427,12 +1925,13 @@ void nsvgRasterize(NSVGrasterizer* r,
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
                 nsvg__initPaint(&cache, &shape->fill, shape->opacity);
 
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
+                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule, r->clipRoot);
             }
             if (paintOrder == NSVG_PAINT_STROKE && shape->stroke.type != NSVG_PAINT_NONE && (shape->strokeWidth * scale) > 0.01f) {
                 nsvg__resetPool(r);
                 r->freelist = NULL;
                 r->nedges = 0;
+                nsvgrast__resetClipState(r->clipRoot);
 
                 nsvg__flattenShapeStroke(r, shape, scale);
 
@@ -1454,9 +1953,11 @@ void nsvgRasterize(NSVGrasterizer* r,
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
                 nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
 
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
+                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO, r->clipRoot);
             }
         }
+		nsvgrast__deleteClipTree(r->clipRoot);
+		r->clipRoot = NULL;
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);
@@ -1465,6 +1966,7 @@ void nsvgRasterize(NSVGrasterizer* r,
 	r->width = 0;
 	r->height = 0;
 	r->stride = 0;
+	r->image = NULL;
 }
 
 #endif // NANOSVGRAST_IMPLEMENTATION

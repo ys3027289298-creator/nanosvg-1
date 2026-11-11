@@ -24,6 +24,10 @@ Thumbs.db
 ## Build dir
 build/*
 
+## Local test tools and generated comparison images
+.tools/
+tests/clips/out/
+
 ## Stuff in example
 example/_*
 

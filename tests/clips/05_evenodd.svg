@@ -1,0 +1,8 @@
+<svg width="200" height="160" viewBox="0 0 200 160" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="evenodd-clip">
+      <path clip-rule="evenodd" d="M35,25 H165 V135 H35 Z M75,55 H125 V105 H75 Z"/>
+    </clipPath>
+  </defs>
+  <rect x="0" y="0" width="200" height="160" fill="#d84f8c" clip-path="url(#evenodd-clip)"/>
+</svg>

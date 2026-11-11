@@ -32,6 +32,26 @@ The parser library is accompanied with really simpler SVG rasterizer. Currently 
 
 The intended usage for the rasterizer is to for example bake icons of different size into a texture. The rasterizer is not particular fast or accurate, but it's small and packed in one header file.
 
+## Clip Paths
+
+`<clipPath>` definitions are parsed from `<defs>` and can be referenced with
+`clip-path="url(#id)"` on shapes and groups. Both `userSpaceOnUse` and
+`objectBoundingBox` units are supported. Group and nested references are
+intersected, and each clip child honors its own transform and `clip-rule`
+(`nonzero` or `evenodd`). Missing references are ignored.
+
+The rasterizer intersects clip coverage during scanline filling, so no
+temporary bitmap is rendered and combined per pixel.
+
+Clip regression fixtures and reference comparisons live in `tests/clips`:
+
+```bash
+# rsvg-convert is used as the pixel reference.
+tests/clips/run_tests.sh
+```
+
+Set `RSVG_CONVERT=/path/to/rsvg-convert` if it is not on `PATH`.
+
 
 ## Example Usage
 
