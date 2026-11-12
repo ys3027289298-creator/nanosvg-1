@@ -1372,16 +1372,250 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+static void nsvg__paintShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale)
+{
+	NSVGedge *e = NULL;
+	NSVGcachedPaint cache;
+	int i;
+	int j;
+	unsigned char paintOrder;
+
+	for (j = 0; j < 3; j++) {
+		paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
+
+		if (paintOrder == NSVG_PAINT_FILL && shape->fill.type != NSVG_PAINT_NONE) {
+			nsvg__resetPool(r);
+			r->freelist = NULL;
+			r->nedges = 0;
+
+			nsvg__flattenShape(r, shape, scale);
+
+			// Scale and translate edges
+			for (i = 0; i < r->nedges; i++) {
+				e = &r->edges[i];
+				e->x0 = tx + e->x0;
+				e->y0 = (ty + e->y0) * NSVG__SUBSAMPLES;
+				e->x1 = tx + e->x1;
+				e->y1 = (ty + e->y1) * NSVG__SUBSAMPLES;
+			}
+
+			// Rasterize edges
+			if (r->nedges != 0)
+				qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
+
+			// now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
+			nsvg__initPaint(&cache, &shape->fill, shape->opacity);
+
+			nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
+		}
+		if (paintOrder == NSVG_PAINT_STROKE && shape->stroke.type != NSVG_PAINT_NONE && (shape->strokeWidth * scale) > 0.01f) {
+			nsvg__resetPool(r);
+			r->freelist = NULL;
+			r->nedges = 0;
+
+			nsvg__flattenShapeStroke(r, shape, scale);
+
+//			dumpEdges(r, "edge.svg");
+
+			// Scale and translate edges
+			for (i = 0; i < r->nedges; i++) {
+				e = &r->edges[i];
+				e->x0 = tx + e->x0;
+				e->y0 = (ty + e->y0) * NSVG__SUBSAMPLES;
+				e->x1 = tx + e->x1;
+				e->y1 = (ty + e->y1) * NSVG__SUBSAMPLES;
+			}
+
+			// Rasterize edges
+			if (r->nedges != 0)
+				qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
+
+			// now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
+			nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
+
+			nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
+		}
+	}
+}
+
+typedef struct NSVGfilterLayer
+{
+	char name[NSVG_MAX_NAME];
+	unsigned char* pixels;
+	int width, height;
+} NSVGfilterLayer;
+
+static unsigned char* nsvg__findLayer(NSVGfilterLayer* layers, int nlayers, const char* name)
+{
+	int i;
+	if (name == NULL || name[0] == '\0')
+		return NULL;
+	for (i = nlayers - 1; i >= 0; i--) {
+		if (strcmp(layers[i].name, name) == 0)
+			return layers[i].pixels;
+	}
+	return NULL;
+}
+
+static void nsvg__applyFilter(NSVGrasterizer* r, NSVGshape* shape, NSVGfilter* filter,
+							  float tx, float ty, float scale)
+{
+	int frx, fry, frw, frh, x0, y0, x1, y1;
+	NSVGfilterLayer layers[NSVG_MAX_FILTER_PRIMS];
+	int nlayers = 0, i, k;
+	unsigned char* prev = NULL;
+
+	memset(layers, 0, sizeof(layers));
+
+	if (filter->units == NSVG_OBJECT_BOUNDING_BOX) {
+		float bw = shape->bounds[2] - shape->bounds[0];
+		float bh = shape->bounds[3] - shape->bounds[1];
+		x0 = (int)floorf((shape->bounds[0] + filter->region[0] * bw) * scale + tx);
+		y0 = (int)floorf((shape->bounds[1] + filter->region[1] * bh) * scale + ty);
+		x1 = (int)ceilf((shape->bounds[0] + (filter->region[0] + filter->region[2]) * bw) * scale + tx);
+		y1 = (int)ceilf((shape->bounds[1] + (filter->region[1] + filter->region[3]) * bh) * scale + ty);
+	} else {
+		x0 = (int)floorf(filter->region[0] * scale + tx);
+		y0 = (int)floorf(filter->region[1] * scale + ty);
+		x1 = (int)ceilf((filter->region[0] + filter->region[2]) * scale + tx);
+		y1 = (int)ceilf((filter->region[1] + filter->region[3]) * scale + ty);
+	}
+
+	// Clip the filter region to the destination buffer.
+	frx = x0 > 0 ? x0 : 0;
+	fry = y0 > 0 ? y0 : 0;
+	x1 = x1 < r->width ? x1 : r->width;
+	y1 = y1 < r->height ? y1 : r->height;
+	frw = x1 - frx;
+	frh = y1 - fry;
+	if (frw <= 0 || frh <= 0)
+		return;
+
+	for (k = 0; k < filter->nprims && k < NSVG_MAX_FILTER_PRIMS; k++) {
+		NSVGfilterPrimitive* prim = &filter->prims[k];
+		NSVGfilterLayer* layer = &layers[nlayers];
+		unsigned char* input = NULL;
+		unsigned char* sourceBuffer = NULL;
+
+		layer->width = frw;
+		layer->height = frh;
+		strncpy(layer->name, prim->result, NSVG_MAX_NAME - 1);
+		layer->pixels = NULL;
+
+		if (strcmp(prim->in, "SourceGraphic") == 0 &&
+			prim->type == NSVG_FILTER_OFFSET) {
+			unsigned char* savedBitmap = r->bitmap;
+			int savedWidth = r->width, savedHeight = r->height, savedStride = r->stride;
+			int savedScan = r->cscanline;
+			unsigned char* savedScanline = r->scanline;
+			unsigned char* offscreenScanline = NULL;
+			sourceBuffer = (unsigned char*)calloc((size_t)frw * frh * 4, 1);
+			if (sourceBuffer == NULL)
+				break;
+			r->bitmap = sourceBuffer;
+			r->width = frw;
+			r->height = frh;
+			r->stride = frw * 4;
+			if (r->cscanline >= frw) {
+				r->scanline = savedScanline;
+			} else {
+				offscreenScanline = (unsigned char*)malloc(frw);
+				if (offscreenScanline == NULL)
+				{
+					free(sourceBuffer);
+					break;
+				}
+				r->scanline = offscreenScanline;
+				r->cscanline = frw;
+			}
+			nsvg__paintShape(r, shape, tx - frx, ty - fry, scale);
+			free(offscreenScanline);
+			r->bitmap = savedBitmap;
+			r->width = savedWidth;
+			r->height = savedHeight;
+			r->stride = savedStride;
+			r->scanline = savedScanline;
+			r->cscanline = savedScan;
+			input = sourceBuffer;
+		} else if (prim->in[0] != '\0') {
+			input = nsvg__findLayer(layers, nlayers, prim->in);
+		} else {
+			input = prev;
+		}
+
+		layer->pixels = (unsigned char*)calloc((size_t)frw * frh * 4, 1);
+		if (layer->pixels == NULL) {
+			free(sourceBuffer);
+			break;
+		}
+
+		if (prim->type == NSVG_FILTER_FLOOD) {
+			int a = (int)(prim->opacity * 255.0f + 0.5f);
+			int cr = prim->color & 0xff;
+			int cg = (prim->color >> 8) & 0xff;
+			int cb = (prim->color >> 16) & 0xff;
+			unsigned char* dst = layer->pixels;
+			int count = frw * frh;
+			for (i = 0; i < count; i++) {
+				dst[0] = (unsigned char)nsvg__div255(cr * a);
+				dst[1] = (unsigned char)nsvg__div255(cg * a);
+				dst[2] = (unsigned char)nsvg__div255(cb * a);
+				dst[3] = (unsigned char)a;
+				dst += 4;
+			}
+		} else if (prim->type == NSVG_FILTER_OFFSET && input != NULL) {
+			int ox = (int)(prim->dx * scale + (prim->dx >= 0 ? 0.5f : -0.5f));
+			int oy = (int)(prim->dy * scale + (prim->dy >= 0 ? 0.5f : -0.5f));
+			int sy, sx;
+			for (sy = 0; sy < frh; sy++) {
+				for (sx = 0; sx < frw; sx++) {
+					int srcx = sx - ox;
+					int srcy = sy - oy;
+					if (srcx >= 0 && srcx < frw && srcy >= 0 && srcy < frh) {
+						unsigned char* d = &layer->pixels[(sy * frw + sx) * 4];
+						unsigned char* s = &input[(srcy * frw + srcx) * 4];
+						d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+					}
+					// Pixels outside the shifted input stay transparent (calloc).
+				}
+			}
+		}
+
+		free(sourceBuffer);
+
+		prev = layer->pixels;
+		nlayers++;
+	}
+
+	// Composite the last primitive result over the destination (premultiplied).
+	if (prev != NULL) {
+		int sy, sx;
+		for (sy = 0; sy < frh; sy++) {
+			unsigned char* dstRow = &r->bitmap[(fry + sy) * r->stride + frx * 4];
+			unsigned char* srcRow = &prev[sy * frw * 4];
+			for (sx = 0; sx < frw; sx++) {
+				int a = srcRow[3];
+				int ia = 255 - a;
+				dstRow[0] = (unsigned char)(srcRow[0] + nsvg__div255(ia * dstRow[0]));
+				dstRow[1] = (unsigned char)(srcRow[1] + nsvg__div255(ia * dstRow[1]));
+				dstRow[2] = (unsigned char)(srcRow[2] + nsvg__div255(ia * dstRow[2]));
+				dstRow[3] = (unsigned char)(a + nsvg__div255(ia * dstRow[3]));
+				dstRow += 4;
+				srcRow += 4;
+			}
+		}
+	}
+
+	for (i = 0; i < nlayers; i++)
+		free(layers[i].pixels);
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
 {
 	NSVGshape *shape = NULL;
-	NSVGedge *e = NULL;
-	NSVGcachedPaint cache;
 	int i;
-    int j;
-    unsigned char paintOrder;
 
 	r->bitmap = dst;
 	r->width = w;
@@ -1401,62 +1635,16 @@ void nsvgRasterize(NSVGrasterizer* r,
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
 
-        for (j = 0; j < 3; j++) {
-            paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
-
-            if (paintOrder == NSVG_PAINT_FILL && shape->fill.type != NSVG_PAINT_NONE) {
-                nsvg__resetPool(r);
-                r->freelist = NULL;
-                r->nedges = 0;
-
-                nsvg__flattenShape(r, shape, scale);
-
-                // Scale and translate edges
-                for (i = 0; i < r->nedges; i++) {
-                    e = &r->edges[i];
-                    e->x0 = tx + e->x0;
-                    e->y0 = (ty + e->y0) * NSVG__SUBSAMPLES;
-                    e->x1 = tx + e->x1;
-                    e->y1 = (ty + e->y1) * NSVG__SUBSAMPLES;
-                }
-
-                // Rasterize edges
-                if (r->nedges != 0)
-                    qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
-
-                // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
-                nsvg__initPaint(&cache, &shape->fill, shape->opacity);
-
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
-            }
-            if (paintOrder == NSVG_PAINT_STROKE && shape->stroke.type != NSVG_PAINT_NONE && (shape->strokeWidth * scale) > 0.01f) {
-                nsvg__resetPool(r);
-                r->freelist = NULL;
-                r->nedges = 0;
-
-                nsvg__flattenShapeStroke(r, shape, scale);
-
-    //			dumpEdges(r, "edge.svg");
-
-                // Scale and translate edges
-                for (i = 0; i < r->nedges; i++) {
-                    e = &r->edges[i];
-                    e->x0 = tx + e->x0;
-                    e->y0 = (ty + e->y0) * NSVG__SUBSAMPLES;
-                    e->x1 = tx + e->x1;
-                    e->y1 = (ty + e->y1) * NSVG__SUBSAMPLES;
-                }
-
-                // Rasterize edges
-                if (r->nedges != 0)
-                    qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
-
-                // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
-                nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
-
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
-            }
-        }
+		if (shape->filter[0] != '\0' && image->filters != NULL) {
+			NSVGfilter* filter = image->filters;
+			while (filter != NULL && strcmp(filter->id, shape->filter) != 0)
+				filter = filter->next;
+			if (filter != NULL) {
+				nsvg__applyFilter(r, shape, filter, tx, ty, scale);
+				continue;
+			}
+		}
+		nsvg__paintShape(r, shape, tx, ty, scale);
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);

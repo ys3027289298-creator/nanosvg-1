@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <filter id="back" filterUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <feFlood flood-color="#0000ff" flood-opacity="1" result="plate"/>
+      <feOffset in="plate" dx="10" dy="10" result="shifted"/>
+    </filter>
+  </defs>
+  <rect x="12" y="12" width="20" height="20" fill="#cccccc" filter="url(#back)"/>
+</svg>
