@@ -102,6 +102,13 @@ enum NSVGfillRule {
 	NSVG_FILLRULE_EVENODD = 1
 };
 
+enum NSVGshapeRendering {
+	NSVG_SHAPE_RENDERING_AUTO = 0,
+	NSVG_SHAPE_RENDERING_OPTIMIZESPEED = 1,
+	NSVG_SHAPE_RENDERING_GEOMETRICPRECISION = 2,
+	NSVG_SHAPE_RENDERING_CRISPEDGES = 3
+};
+
 enum NSVGflags {
 	NSVG_FLAGS_VISIBLE = 0x01
 };
@@ -156,6 +163,7 @@ typedef struct NSVGshape
 	char strokeLineCap;			// Stroke cap type.
 	float miterLimit;			// Miter limit
 	char fillRule;				// Fill rule, see NSVGfillRule.
+	char shapeRendering;		// Shape rendering, see NSVGshapeRendering.
     unsigned char paintOrder;	// Encoded paint order (3×2-bit fields) see NSVGpaintOrder
 	unsigned char flags;		// Logical or of NSVG_FLAGS_* flags
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
@@ -438,6 +446,7 @@ typedef struct NSVGattrib
 	char strokeLineCap;
 	float miterLimit;
 	char fillRule;
+	char shapeRendering;
 	float fontSize;
 	unsigned int stopColor;
 	float stopOpacity;
@@ -661,6 +670,7 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].strokeLineCap = NSVG_CAP_BUTT;
 	p->attr[0].miterLimit = 4;
 	p->attr[0].fillRule = NSVG_FILLRULE_NONZERO;
+	p->attr[0].shapeRendering = NSVG_SHAPE_RENDERING_AUTO;
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
@@ -1004,6 +1014,7 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->strokeLineCap = attr->strokeLineCap;
 	shape->miterLimit = attr->miterLimit;
 	shape->fillRule = attr->fillRule;
+	shape->shapeRendering = attr->shapeRendering;
 	shape->opacity = attr->opacity;
     shape->paintOrder = attr->paintOrder;
 
@@ -1766,6 +1777,21 @@ static char nsvg__parseFillRule(const char* str)
 	return NSVG_FILLRULE_NONZERO;
 }
 
+static char nsvg__parseShapeRendering(const char* str)
+{
+	if (strcmp(str, "crispEdges") == 0 ||
+		strcmp(str, "crispedges") == 0)
+		return NSVG_SHAPE_RENDERING_CRISPEDGES;
+	else if (strcmp(str, "optimizeSpeed") == 0 ||
+		strcmp(str, "optimizespeed") == 0)
+		return NSVG_SHAPE_RENDERING_OPTIMIZESPEED;
+	else if (strcmp(str, "geometricPrecision") == 0 ||
+		strcmp(str, "geometricprecision") == 0)
+		return NSVG_SHAPE_RENDERING_GEOMETRICPRECISION;
+	// 'auto', 'inherit' and unknown values keep the default behavior.
+	return NSVG_SHAPE_RENDERING_AUTO;
+}
+
 static unsigned char nsvg__parsePaintOrder(const char* str)
 {
 	if (strcmp(str, "normal") == 0 || strcmp(str, "fill stroke markers") == 0)
@@ -1909,6 +1935,8 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->miterLimit = nsvg__parseMiterLimit(value);
 	} else if (strcmp(name, "fill-rule") == 0) {
 		attr->fillRule = nsvg__parseFillRule(value);
+	} else if (strcmp(name, "shape-rendering") == 0) {
+		attr->shapeRendering = nsvg__parseShapeRendering(value);
 	} else if (strcmp(name, "font-size") == 0) {
 		attr->fontSize = nsvg__parseCoordinate(p, value, 0.0f, nsvg__actualLength(p));
 	} else if (strcmp(name, "transform") == 0) {

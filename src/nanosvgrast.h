@@ -893,13 +893,31 @@ static void nsvg__freeActive(NSVGrasterizer* r, NSVGactiveEdge* z)
 	r->freelist = z;
 }
 
-static void nsvg__fillScanline(unsigned char* scanline, int len, int x0, int x1, int maxWeight, int* xmin, int* xmax)
+static void nsvg__fillScanline(unsigned char* scanline, int len, int x0, int x1, int maxWeight, int* xmin, int* xmax, int antialias)
 {
 	int i = x0 >> NSVG__FIXSHIFT;
 	int j = x1 >> NSVG__FIXSHIFT;
 	if (i < *xmin) *xmin = i;
 	if (j > *xmax) *xmax = j;
 	if (i < len && j >= 0) {
+		if (!antialias) {
+			// 'crispEdges': snap fractional coverage to fully covered or empty.
+			// Coverage of exactly half rounds up, matching browser conventions.
+			if (i == j) {
+				if (x1 - x0 >= (NSVG__FIX >> 1))
+					scanline[i] = (unsigned char)(scanline[i] + maxWeight);
+			} else {
+				if (NSVG__FIX - (x0 & NSVG__FIXMASK) >= (NSVG__FIX >> 1) && i >= 0)
+					scanline[i] = (unsigned char)(scanline[i] + maxWeight);
+				if ((x1 & NSVG__FIXMASK) >= (NSVG__FIX >> 1) && j < len)
+					scanline[j] = (unsigned char)(scanline[j] + maxWeight);
+				if (i < 0) i = -1;
+				if (j >= len) j = len;
+				for (++i; i < j; ++i)
+					scanline[i] = (unsigned char)(scanline[i] + maxWeight);
+			}
+			return;
+		}
 		if (i == j) {
 			// x0,x1 are the same pixel, so compute combined coverage
 			scanline[i] = (unsigned char)(scanline[i] + ((x1 - x0) * maxWeight >> NSVG__FIXSHIFT));
@@ -923,7 +941,7 @@ static void nsvg__fillScanline(unsigned char* scanline, int len, int x0, int x1,
 // note: this routine clips fills that extend off the edges... ideally this
 // wouldn't happen, but it could happen if the truetype glyph bounding boxes
 // are wrong, or if the user supplies a too-small bitmap
-static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEdge* e, int maxWeight, int* xmin, int* xmax, char fillRule)
+static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEdge* e, int maxWeight, int* xmin, int* xmax, char fillRule, int antialias)
 {
 	// non-zero winding fill
 	int x0 = 0, w = 0;
@@ -938,7 +956,7 @@ static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEd
 				int x1 = e->x; w += e->dir;
 				// if we went to zero, we need to draw
 				if (w == 0)
-					nsvg__fillScanline(scanline, len, x0, x1, maxWeight, xmin, xmax);
+					nsvg__fillScanline(scanline, len, x0, x1, maxWeight, xmin, xmax, antialias);
 			}
 			e = e->next;
 		}
@@ -950,7 +968,7 @@ static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEd
 				x0 = e->x; w = 1;
 			} else {
 				int x1 = e->x; w = 0;
-				nsvg__fillScanline(scanline, len, x0, x1, maxWeight, xmin, xmax);
+				nsvg__fillScanline(scanline, len, x0, x1, maxWeight, xmin, xmax, antialias);
 			}
 			e = e->next;
 		}
@@ -1121,21 +1139,21 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 	}
 }
 
-static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule)
+static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule, int subsamples, int antialias)
 {
 	NSVGactiveEdge *active = NULL;
 	int y, s;
 	int e = 0;
-	int maxWeight = (255 / NSVG__SUBSAMPLES);  // weight per vertical scanline
+	int maxWeight = (255 / subsamples);  // weight per vertical scanline
 	int xmin, xmax;
 
 	for (y = 0; y < r->height; y++) {
 		memset(r->scanline, 0, r->width);
 		xmin = r->width;
 		xmax = 0;
-		for (s = 0; s < NSVG__SUBSAMPLES; ++s) {
+		for (s = 0; s < subsamples; ++s) {
 			// find center of pixel for this scanline
-			float scany = (float)(y*NSVG__SUBSAMPLES + s) + 0.5f;
+			float scany = (float)(y*subsamples + s) + 0.5f;
 			NSVGactiveEdge **step = &active;
 
 			// update all active edges;
@@ -1197,7 +1215,7 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 
 			// now process all active edges in non-zero fashion
 			if (active != NULL)
-				nsvg__fillActiveEdges(r->scanline, r->width, active, maxWeight, &xmin, &xmax, fillRule);
+				nsvg__fillActiveEdges(r->scanline, r->width, active, maxWeight, &xmin, &xmax, fillRule, antialias);
 		}
 		// Blit
 		if (xmin < 0) xmin = 0;
@@ -1382,6 +1400,7 @@ void nsvgRasterize(NSVGrasterizer* r,
 	int i;
     int j;
     unsigned char paintOrder;
+	int subsamples, antialias;
 
 	r->bitmap = dst;
 	r->width = w;
@@ -1401,6 +1420,11 @@ void nsvgRasterize(NSVGrasterizer* r,
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
 
+		// 'crispEdges' disables supersampling and snaps fractional coverage;
+		// all other rendering hints keep the existing supersampled output.
+		antialias = shape->shapeRendering != NSVG_SHAPE_RENDERING_CRISPEDGES;
+		subsamples = antialias ? NSVG__SUBSAMPLES : 1;
+
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
 
@@ -1415,9 +1439,9 @@ void nsvgRasterize(NSVGrasterizer* r,
                 for (i = 0; i < r->nedges; i++) {
                     e = &r->edges[i];
                     e->x0 = tx + e->x0;
-                    e->y0 = (ty + e->y0) * NSVG__SUBSAMPLES;
+                    e->y0 = (ty + e->y0) * subsamples;
                     e->x1 = tx + e->x1;
-                    e->y1 = (ty + e->y1) * NSVG__SUBSAMPLES;
+                    e->y1 = (ty + e->y1) * subsamples;
                 }
 
                 // Rasterize edges
@@ -1427,7 +1451,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
                 nsvg__initPaint(&cache, &shape->fill, shape->opacity);
 
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
+                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule, subsamples, antialias);
             }
             if (paintOrder == NSVG_PAINT_STROKE && shape->stroke.type != NSVG_PAINT_NONE && (shape->strokeWidth * scale) > 0.01f) {
                 nsvg__resetPool(r);
@@ -1442,9 +1466,9 @@ void nsvgRasterize(NSVGrasterizer* r,
                 for (i = 0; i < r->nedges; i++) {
                     e = &r->edges[i];
                     e->x0 = tx + e->x0;
-                    e->y0 = (ty + e->y0) * NSVG__SUBSAMPLES;
+                    e->y0 = (ty + e->y0) * subsamples;
                     e->x1 = tx + e->x1;
-                    e->y1 = (ty + e->y1) * NSVG__SUBSAMPLES;
+                    e->y1 = (ty + e->y1) * subsamples;
                 }
 
                 // Rasterize edges
@@ -1454,7 +1478,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
                 nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
 
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
+                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO, subsamples, antialias);
             }
         }
 	}
