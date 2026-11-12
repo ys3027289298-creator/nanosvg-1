@@ -482,6 +482,11 @@ static void nsvg__xformIdentity(float* t)
 	t[4] = 0.0f; t[5] = 0.0f;
 }
 
+static int nsvg__xformIsIdentity(const float* t)
+{
+	return t[0] == 1.0f && t[1] == 0.0f && t[2] == 0.0f && t[3] == 1.0f && t[4] == 0.0f && t[5] == 0.0f;
+}
+
 static void nsvg__xformSetTranslation(float* t, float tx, float ty)
 {
 	t[0] = 1.0f; t[1] = 0.0f;
@@ -899,34 +904,71 @@ static NSVGgradient* nsvg__createGradient(NSVGparser* p, const char* id, const f
 	}
 	sl = sqrtf(sw*sw + sh*sh) / sqrtf(2.0f);
 
-	if (data->type == NSVG_PAINT_LINEAR_GRADIENT) {
-		float x1, y1, x2, y2, dx, dy;
-		x1 = nsvg__convertToPixels(p, data->linear.x1, ox, sw);
-		y1 = nsvg__convertToPixels(p, data->linear.y1, oy, sh);
-		x2 = nsvg__convertToPixels(p, data->linear.x2, ox, sw);
-		y2 = nsvg__convertToPixels(p, data->linear.y2, oy, sh);
-		// Calculate transform aligned to the line
-		dx = x2 - x1;
-		dy = y2 - y1;
-		grad->xform[0] = dy; grad->xform[1] = -dx;
-		grad->xform[2] = dx; grad->xform[3] = dy;
-		grad->xform[4] = x1; grad->xform[5] = y1;
+	if (data->units == NSVG_OBJECT_SPACE && !nsvg__xformIsIdentity(data->xform)) {
+		// For objectBoundingBox units the gradientTransform is defined in the bounding
+		// box space: resolve the gradient geometry in unit bbox space, apply the
+		// gradientTransform there, then map the result to user space.
+		float bbox[6];
+		bbox[0] = sw; bbox[1] = 0.0f;
+		bbox[2] = 0.0f; bbox[3] = sh;
+		bbox[4] = ox; bbox[5] = oy;
+		if (data->type == NSVG_PAINT_LINEAR_GRADIENT) {
+			float x1, y1, x2, y2, dx, dy;
+			x1 = nsvg__convertToPixels(p, data->linear.x1, 0.0f, 1.0f);
+			y1 = nsvg__convertToPixels(p, data->linear.y1, 0.0f, 1.0f);
+			x2 = nsvg__convertToPixels(p, data->linear.x2, 0.0f, 1.0f);
+			y2 = nsvg__convertToPixels(p, data->linear.y2, 0.0f, 1.0f);
+			// Calculate transform aligned to the line
+			dx = x2 - x1;
+			dy = y2 - y1;
+			grad->xform[0] = dy; grad->xform[1] = -dx;
+			grad->xform[2] = dx; grad->xform[3] = dy;
+			grad->xform[4] = x1; grad->xform[5] = y1;
+		} else {
+			float cx, cy, fx, fy, r;
+			cx = nsvg__convertToPixels(p, data->radial.cx, 0.0f, 1.0f);
+			cy = nsvg__convertToPixels(p, data->radial.cy, 0.0f, 1.0f);
+			fx = nsvg__convertToPixels(p, data->radial.fx, 0.0f, 1.0f);
+			fy = nsvg__convertToPixels(p, data->radial.fy, 0.0f, 1.0f);
+			r = nsvg__convertToPixels(p, data->radial.r, 0.0f, 1.0f);
+			// Calculate transform aligned to the circle
+			grad->xform[0] = r; grad->xform[1] = 0;
+			grad->xform[2] = 0; grad->xform[3] = r;
+			grad->xform[4] = cx; grad->xform[5] = cy;
+			grad->fx = fx / r;
+			grad->fy = fy / r;
+		}
+		nsvg__xformMultiply(grad->xform, data->xform);
+		nsvg__xformMultiply(grad->xform, bbox);
 	} else {
-		float cx, cy, fx, fy, r;
-		cx = nsvg__convertToPixels(p, data->radial.cx, ox, sw);
-		cy = nsvg__convertToPixels(p, data->radial.cy, oy, sh);
-		fx = nsvg__convertToPixels(p, data->radial.fx, ox, sw);
-		fy = nsvg__convertToPixels(p, data->radial.fy, oy, sh);
-		r = nsvg__convertToPixels(p, data->radial.r, 0, sl);
-		// Calculate transform aligned to the circle
-		grad->xform[0] = r; grad->xform[1] = 0;
-		grad->xform[2] = 0; grad->xform[3] = r;
-		grad->xform[4] = cx; grad->xform[5] = cy;
-		grad->fx = fx / r;
-		grad->fy = fy / r;
+		if (data->type == NSVG_PAINT_LINEAR_GRADIENT) {
+			float x1, y1, x2, y2, dx, dy;
+			x1 = nsvg__convertToPixels(p, data->linear.x1, ox, sw);
+			y1 = nsvg__convertToPixels(p, data->linear.y1, oy, sh);
+			x2 = nsvg__convertToPixels(p, data->linear.x2, ox, sw);
+			y2 = nsvg__convertToPixels(p, data->linear.y2, oy, sh);
+			// Calculate transform aligned to the line
+			dx = x2 - x1;
+			dy = y2 - y1;
+			grad->xform[0] = dy; grad->xform[1] = -dx;
+			grad->xform[2] = dx; grad->xform[3] = dy;
+			grad->xform[4] = x1; grad->xform[5] = y1;
+		} else {
+			float cx, cy, fx, fy, r;
+			cx = nsvg__convertToPixels(p, data->radial.cx, ox, sw);
+			cy = nsvg__convertToPixels(p, data->radial.cy, oy, sh);
+			fx = nsvg__convertToPixels(p, data->radial.fx, ox, sw);
+			fy = nsvg__convertToPixels(p, data->radial.fy, oy, sh);
+			r = nsvg__convertToPixels(p, data->radial.r, 0, sl);
+			// Calculate transform aligned to the circle
+			grad->xform[0] = r; grad->xform[1] = 0;
+			grad->xform[2] = 0; grad->xform[3] = r;
+			grad->xform[4] = cx; grad->xform[5] = cy;
+			grad->fx = fx / r;
+			grad->fy = fy / r;
+		}
+		nsvg__xformMultiply(grad->xform, data->xform);
 	}
-
-	nsvg__xformMultiply(grad->xform, data->xform);
 	nsvg__xformMultiply(grad->xform, xform);
 
 	grad->spread = data->spread;

@@ -993,6 +993,17 @@ static inline int nsvg__div255(int x)
     return ((x+1) * 257) >> 16;
 }
 
+static float nsvg__spreadGradient(char spread, float t)
+{
+	if (spread == NSVG_SPREAD_REPEAT) {
+		t = t - floorf(t);
+	} else if (spread == NSVG_SPREAD_REFLECT) {
+		t = t - 2.0f*floorf(t*0.5f);
+		if (t > 1.0f) t = 2.0f - t;
+	}
+	return t;
+}
+
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
@@ -1028,7 +1039,6 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			dst += 4;
 		}
 	} else if (cache->type == NSVG_PAINT_LINEAR_GRADIENT) {
-		// TODO: spread modes.
 		// TODO: plenty of opportunities to optimize.
 		float fx, fy, dx, gy;
 		float* t = cache->xform;
@@ -1042,6 +1052,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		for (i = 0; i < count; i++) {
 			int r,g,b,a,ia;
 			gy = fx*t[1] + fy*t[3] + t[5];
+			gy = nsvg__spreadGradient(cache->spread, gy);
 			c = cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)];
 			cr = (c) & 0xff;
 			cg = (c >> 8) & 0xff;
@@ -1072,7 +1083,6 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			fx += dx;
 		}
 	} else if (cache->type == NSVG_PAINT_RADIAL_GRADIENT) {
-		// TODO: spread modes.
 		// TODO: plenty of opportunities to optimize.
 		// TODO: focus (fx,fy)
 		float fx, fy, dx, gx, gy, gd;
@@ -1089,6 +1099,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			gx = fx*t[0] + fy*t[2] + t[4];
 			gy = fx*t[1] + fy*t[3] + t[5];
 			gd = sqrtf(gx*gx + gy*gy);
+			gd = nsvg__spreadGradient(cache->spread, gd);
 			c = cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)];
 			cr = (c) & 0xff;
 			cg = (c >> 8) & 0xff;

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" viewBox="0 0 120 60">
+  <defs>
+    <linearGradient id="bbox" x1="0%" y1="0%" x2="100%" y2="0%" gradientTransform="rotate(45 0.5 0.5)">
+      <stop offset="0" stop-color="#ff0000"/>
+      <stop offset="1" stop-color="#0000ff"/>
+    </linearGradient>
+    <linearGradient id="user" gradientUnits="userSpaceOnUse" x1="60" y1="0" x2="120" y2="0" gradientTransform="rotate(45 90 30)">
+      <stop offset="0" stop-color="#ff0000"/>
+      <stop offset="1" stop-color="#0000ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="60" height="60" fill="url(#bbox)"/>
+  <rect x="60" y="0" width="60" height="60" fill="url(#user)"/>
+</svg>
