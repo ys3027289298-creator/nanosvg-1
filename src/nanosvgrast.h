@@ -993,8 +993,157 @@ static inline int nsvg__div255(int x)
     return ((x+1) * 257) >> 16;
 }
 
+// Blend modes as defined by https://www.w3.org/TR/compositing-1/#blending
+static float nsvg__min3f(float a, float b, float c) { float m = a < b ? a : b; return m < c ? m : c; }
+static float nsvg__max3f(float a, float b, float c) { float m = a > b ? a : b; return m > c ? m : c; }
+static float nsvg__lum3f(const float* c) { return 0.3f*c[0] + 0.59f*c[1] + 0.11f*c[2]; }
+
+static float nsvg__blendSeparable(int mode, float cb, float cs)
+{
+	switch (mode) {
+	case NSVG_BLEND_MULTIPLY: return cb * cs;
+	case NSVG_BLEND_SCREEN: return cb + cs - cb * cs;
+	case NSVG_BLEND_OVERLAY: return cb <= 0.5f ? 2.0f*cb*cs : 1.0f - 2.0f*(1.0f-cb)*(1.0f-cs);
+	case NSVG_BLEND_DARKEN: return cb < cs ? cb : cs;
+	case NSVG_BLEND_LIGHTEN: return cb > cs ? cb : cs;
+	case NSVG_BLEND_COLOR_DODGE: return cb >= 1.0f ? 1.0f : (cs >= 1.0f ? 1.0f : (cb/(1.0f-cs) < 1.0f ? cb/(1.0f-cs) : 1.0f));
+	case NSVG_BLEND_COLOR_BURN: return cb <= 0.0f ? 0.0f : (cs <= 0.0f ? 0.0f : 1.0f - ((1.0f-cb)/cs < 1.0f ? (1.0f-cb)/cs : 1.0f));
+	case NSVG_BLEND_HARD_LIGHT: return cs <= 0.5f ? 2.0f*cb*cs : 1.0f - 2.0f*(1.0f-cb)*(1.0f-cs);
+	case NSVG_BLEND_SOFT_LIGHT: {
+		float d = cb <= 0.25f ? ((16.0f*cb - 12.0f)*cb + 4.0f)*cb : sqrtf(cb);
+		return cs <= 0.5f ? cb - (1.0f-2.0f*cs)*cb*(1.0f-cb) : cb + (2.0f*cs-1.0f)*(d-cb);
+	}
+	case NSVG_BLEND_DIFFERENCE: return fabsf(cb - cs);
+	case NSVG_BLEND_EXCLUSION: return cb + cs - 2.0f*cb*cs;
+	}
+	return cs;
+}
+
+static void nsvg__clipColor(float* c)
+{
+	float l = nsvg__lum3f(c);
+	float n = nsvg__min3f(c[0], c[1], c[2]);
+	float x = nsvg__max3f(c[0], c[1], c[2]);
+	int i;
+	if (n < 0.0f)
+		for (i = 0; i < 3; i++) c[i] = l + (c[i] - l) * l / (l - n);
+	if (x > 1.0f)
+		for (i = 0; i < 3; i++) c[i] = l + (c[i] - l) * (1.0f - l) / (x - l);
+}
+
+static void nsvg__setLum(float* c, float l)
+{
+	float d = l - nsvg__lum3f(c);
+	c[0] += d; c[1] += d; c[2] += d;
+	nsvg__clipColor(c);
+}
+
+static void nsvg__setSat(float* c, float s)
+{
+	int i, mn = 0, mx = 0;
+	for (i = 1; i < 3; i++) {
+		if (c[i] < c[mn]) mn = i;
+		if (c[i] > c[mx]) mx = i;
+	}
+	if (c[mx] > c[mn]) {
+		for (i = 0; i < 3; i++)
+			if (i != mn && i != mx)
+				c[i] = (c[i] - c[mn]) * s / (c[mx] - c[mn]);
+		c[mx] = s;
+	} else {
+		c[0] = c[1] = c[2] = 0.0f;
+	}
+	c[mn] = 0.0f;
+}
+
+static void nsvg__blendNonSeparable(int mode, const float* cb, const float* cs, float* out)
+{
+	float c[3] = { cs[0], cs[1], cs[2] };
+	if (mode == NSVG_BLEND_HUE) {
+		nsvg__setSat(c, nsvg__max3f(cb[0],cb[1],cb[2]) - nsvg__min3f(cb[0],cb[1],cb[2]));
+		nsvg__setLum(c, nsvg__lum3f(cb));
+	} else if (mode == NSVG_BLEND_SATURATION) {
+		float s = nsvg__max3f(cs[0],cs[1],cs[2]) - nsvg__min3f(cs[0],cs[1],cs[2]);
+		c[0] = cb[0]; c[1] = cb[1]; c[2] = cb[2];
+		nsvg__setSat(c, s);
+		nsvg__setLum(c, nsvg__lum3f(cb));
+	} else if (mode == NSVG_BLEND_COLOR) {
+		nsvg__setLum(c, nsvg__lum3f(cb));
+	} else { // NSVG_BLEND_LUMINOSITY
+		c[0] = cb[0]; c[1] = cb[1]; c[2] = cb[2];
+		nsvg__setLum(c, nsvg__lum3f(cs));
+	}
+	out[0] = c[0]; out[1] = c[1]; out[2] = c[2];
+}
+
+// Composite a source pixel (non-premultiplied cr,cg,cb with alpha a) onto a
+// premultiplied destination pixel using the given blend mode.
+static void nsvg__compositePixel(unsigned char* dst, int cr, int cg, int cb, int a, int blendMode)
+{
+	if (blendMode == NSVG_BLEND_NORMAL) {
+		int ia = 255 - a;
+		dst[0] = (unsigned char)(nsvg__div255(cr * a) + nsvg__div255(ia * (int)dst[0]));
+		dst[1] = (unsigned char)(nsvg__div255(cg * a) + nsvg__div255(ia * (int)dst[1]));
+		dst[2] = (unsigned char)(nsvg__div255(cb * a) + nsvg__div255(ia * (int)dst[2]));
+		dst[3] = (unsigned char)(a + nsvg__div255(ia * (int)dst[3]));
+		return;
+	}
+	{
+		float as = a * (1.0f/255.0f);
+		float ab = dst[3] * (1.0f/255.0f);
+		float cs[3], cbd[3], bl[3];
+		int i;
+		cs[0] = cr * (1.0f/255.0f); cs[1] = cg * (1.0f/255.0f); cs[2] = cb * (1.0f/255.0f);
+		if (ab > 0.0f) {
+			cbd[0] = dst[0] * (1.0f/255.0f) / ab;
+			cbd[1] = dst[1] * (1.0f/255.0f) / ab;
+			cbd[2] = dst[2] * (1.0f/255.0f) / ab;
+		} else {
+			cbd[0] = cbd[1] = cbd[2] = 0.0f;
+		}
+		if (blendMode >= NSVG_BLEND_HUE) {
+			nsvg__blendNonSeparable(blendMode, cbd, cs, bl);
+		} else {
+			for (i = 0; i < 3; i++)
+				bl[i] = nsvg__blendSeparable(blendMode, cbd[i], cs[i]);
+		}
+		// Premultiplied result: Co = (1-ab)*as*Cs + (1-as)*ab*Cb + as*ab*B(Cb,Cs)
+		for (i = 0; i < 3; i++) {
+			float co = (1.0f-ab)*as*cs[i] + (1.0f-as)*ab*cbd[i] + as*ab*bl[i];
+			dst[i] = (unsigned char)(nsvg__clampf(co, 0.0f, 1.0f) * 255.0f + 0.5f);
+		}
+		dst[3] = (unsigned char)(nsvg__clampf(as + ab*(1.0f-as), 0.0f, 1.0f) * 255.0f + 0.5f);
+	}
+}
+
+// Composite a premultiplied layer onto a premultiplied backdrop.
+static void nsvg__compositeLayer(unsigned char* dst, const unsigned char* src, int w, int h, int stride, int blendMode)
+{
+	int x, y;
+	for (y = 0; y < h; y++) {
+		unsigned char* d = &dst[y*stride];
+		const unsigned char* s = &src[y*stride];
+		for (x = 0; x < w; x++) {
+			int a = s[3];
+			if (a != 0) {
+				if (blendMode == NSVG_BLEND_NORMAL) {
+					int ia = 255 - a;
+					d[0] = (unsigned char)(s[0] + nsvg__div255(ia * (int)d[0]));
+					d[1] = (unsigned char)(s[1] + nsvg__div255(ia * (int)d[1]));
+					d[2] = (unsigned char)(s[2] + nsvg__div255(ia * (int)d[2]));
+					d[3] = (unsigned char)(a + nsvg__div255(ia * (int)d[3]));
+				} else {
+					nsvg__compositePixel(d, s[0]*255/a, s[1]*255/a, s[2]*255/a, a, blendMode);
+				}
+			}
+			d += 4;
+			s += 4;
+		}
+	}
+}
+
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
-								float tx, float ty, float scale, NSVGcachedPaint* cache)
+								float tx, float ty, float scale, NSVGcachedPaint* cache, int blendMode)
 {
 
 	if (cache->type == NSVG_PAINT_COLOR) {
@@ -1005,24 +1154,8 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		ca = (cache->colors[0] >> 24) & 0xff;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b;
 			int a = nsvg__div255((int)cover[0] * ca);
-			int ia = 255 - a;
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
+			nsvg__compositePixel(dst, cr, cg, cb, a, blendMode);
 
 			cover++;
 			dst += 4;
@@ -1040,7 +1173,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		dx = 1.0f / scale;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
+			int a;
 			gy = fx*t[1] + fy*t[3] + t[5];
 			c = cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)];
 			cr = (c) & 0xff;
@@ -1049,23 +1182,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			ca = (c >> 24) & 0xff;
 
 			a = nsvg__div255((int)cover[0] * ca);
-			ia = 255 - a;
-
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
+			nsvg__compositePixel(dst, cr, cg, cb, a, blendMode);
 
 			cover++;
 			dst += 4;
@@ -1085,7 +1202,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		dx = 1.0f / scale;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
+			int a;
 			gx = fx*t[0] + fy*t[2] + t[4];
 			gy = fx*t[1] + fy*t[3] + t[5];
 			gd = sqrtf(gx*gx + gy*gy);
@@ -1096,23 +1213,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			ca = (c >> 24) & 0xff;
 
 			a = nsvg__div255((int)cover[0] * ca);
-			ia = 255 - a;
-
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
+			nsvg__compositePixel(dst, cr, cg, cb, a, blendMode);
 
 			cover++;
 			dst += 4;
@@ -1121,7 +1222,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 	}
 }
 
-static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule)
+static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule, int blendMode)
 {
 	NSVGactiveEdge *active = NULL;
 	int y, s;
@@ -1203,7 +1304,7 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 		if (xmin < 0) xmin = 0;
 		if (xmax > r->width-1) xmax = r->width-1;
 		if (xmin <= xmax) {
-			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
+			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache, blendMode);
 		}
 	}
 
@@ -1382,6 +1483,10 @@ void nsvgRasterize(NSVGrasterizer* r,
 	int i;
     int j;
     unsigned char paintOrder;
+	// Stack of isolated group layers; shapes belonging to an isolated group
+	// are rendered to a separate layer which is composited when the group ends.
+	struct { int group; unsigned char blendMode; unsigned char* buf; } layers[16];
+	int nlayers = 0;
 
 	r->bitmap = dst;
 	r->width = w;
@@ -1400,6 +1505,33 @@ void nsvgRasterize(NSVGrasterizer* r,
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
+
+		if (shape->isolateGroup != (nlayers > 0 ? layers[nlayers-1].group : 0)) {
+			int found = -1;
+			for (i = nlayers-1; i >= 0; i--)
+				if (layers[i].group == shape->isolateGroup) { found = i; break; }
+			if (found >= 0) {
+				// Returned to an enclosing group: composite nested layers.
+				while (nlayers-1 > found) {
+					unsigned char* target;
+					nlayers--;
+					target = nlayers > 0 ? layers[nlayers-1].buf : dst;
+					nsvg__compositeLayer(target, layers[nlayers].buf, w, h, stride, layers[nlayers].blendMode);
+					free(layers[nlayers].buf);
+				}
+				r->bitmap = nlayers > 0 ? layers[nlayers-1].buf : dst;
+			} else if (nlayers < 16) {
+				// Entered an isolated group: render to a new transparent layer.
+				unsigned char* buf = (unsigned char*)calloc(1, (size_t)w*h*4);
+				if (buf != NULL) {
+					layers[nlayers].group = shape->isolateGroup;
+					layers[nlayers].blendMode = shape->groupBlendMode;
+					layers[nlayers].buf = buf;
+					nlayers++;
+					r->bitmap = buf;
+				}
+			}
+		}
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1427,7 +1559,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
                 nsvg__initPaint(&cache, &shape->fill, shape->opacity);
 
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
+                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule, shape->blendMode);
             }
             if (paintOrder == NSVG_PAINT_STROKE && shape->stroke.type != NSVG_PAINT_NONE && (shape->strokeWidth * scale) > 0.01f) {
                 nsvg__resetPool(r);
@@ -1454,9 +1586,18 @@ void nsvgRasterize(NSVGrasterizer* r,
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
                 nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
 
-                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
+                nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO, shape->blendMode);
             }
         }
+	}
+
+	// Composite any remaining isolated layers back onto the destination.
+	while (nlayers > 0) {
+		unsigned char* target;
+		nlayers--;
+		target = nlayers > 0 ? layers[nlayers-1].buf : dst;
+		nsvg__compositeLayer(target, layers[nlayers].buf, w, h, stride, layers[nlayers].blendMode);
+		free(layers[nlayers].buf);
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);

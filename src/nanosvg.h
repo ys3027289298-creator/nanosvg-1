@@ -112,6 +112,30 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+enum NSVGblendMode {
+	NSVG_BLEND_NORMAL = 0,
+	NSVG_BLEND_MULTIPLY = 1,
+	NSVG_BLEND_SCREEN = 2,
+	NSVG_BLEND_OVERLAY = 3,
+	NSVG_BLEND_DARKEN = 4,
+	NSVG_BLEND_LIGHTEN = 5,
+	NSVG_BLEND_COLOR_DODGE = 6,
+	NSVG_BLEND_COLOR_BURN = 7,
+	NSVG_BLEND_HARD_LIGHT = 8,
+	NSVG_BLEND_SOFT_LIGHT = 9,
+	NSVG_BLEND_DIFFERENCE = 10,
+	NSVG_BLEND_EXCLUSION = 11,
+	NSVG_BLEND_HUE = 12,
+	NSVG_BLEND_SATURATION = 13,
+	NSVG_BLEND_COLOR = 14,
+	NSVG_BLEND_LUMINOSITY = 15
+};
+
+enum NSVGisolation {
+	NSVG_ISOLATION_AUTO = 0,
+	NSVG_ISOLATION_ISOLATE = 1
+};
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -158,6 +182,9 @@ typedef struct NSVGshape
 	char fillRule;				// Fill rule, see NSVGfillRule.
     unsigned char paintOrder;	// Encoded paint order (3×2-bit fields) see NSVGpaintOrder
 	unsigned char flags;		// Logical or of NSVG_FLAGS_* flags
+	unsigned char blendMode;	// Blend mode of the shape, see NSVGblendMode.
+	unsigned char groupBlendMode; // Blend mode of the innermost isolated group, see NSVGblendMode.
+	int isolateGroup;			// Id of the innermost isolated group, 0 if none.
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
@@ -446,6 +473,10 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	unsigned char blendMode;
+	unsigned char isolation;
+	unsigned char groupBlendMode;
+	int isolateGroup;
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -473,6 +504,7 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	int isolateGroupNext;
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -1006,6 +1038,9 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->fillRule = attr->fillRule;
 	shape->opacity = attr->opacity;
     shape->paintOrder = attr->paintOrder;
+	shape->blendMode = attr->blendMode;
+	shape->groupBlendMode = attr->groupBlendMode;
+	shape->isolateGroup = attr->isolateGroup;
 
 	shape->paths = p->plist;
 	p->plist = NULL;
@@ -1766,6 +1801,26 @@ static char nsvg__parseFillRule(const char* str)
 	return NSVG_FILLRULE_NONZERO;
 }
 
+static unsigned char nsvg__parseBlendMode(const char* str)
+{
+	if (strcmp(str, "multiply") == 0) return NSVG_BLEND_MULTIPLY;
+	else if (strcmp(str, "screen") == 0) return NSVG_BLEND_SCREEN;
+	else if (strcmp(str, "overlay") == 0) return NSVG_BLEND_OVERLAY;
+	else if (strcmp(str, "darken") == 0) return NSVG_BLEND_DARKEN;
+	else if (strcmp(str, "lighten") == 0) return NSVG_BLEND_LIGHTEN;
+	else if (strcmp(str, "color-dodge") == 0) return NSVG_BLEND_COLOR_DODGE;
+	else if (strcmp(str, "color-burn") == 0) return NSVG_BLEND_COLOR_BURN;
+	else if (strcmp(str, "hard-light") == 0) return NSVG_BLEND_HARD_LIGHT;
+	else if (strcmp(str, "soft-light") == 0) return NSVG_BLEND_SOFT_LIGHT;
+	else if (strcmp(str, "difference") == 0) return NSVG_BLEND_DIFFERENCE;
+	else if (strcmp(str, "exclusion") == 0) return NSVG_BLEND_EXCLUSION;
+	else if (strcmp(str, "hue") == 0) return NSVG_BLEND_HUE;
+	else if (strcmp(str, "saturation") == 0) return NSVG_BLEND_SATURATION;
+	else if (strcmp(str, "color") == 0) return NSVG_BLEND_COLOR;
+	else if (strcmp(str, "luminosity") == 0) return NSVG_BLEND_LUMINOSITY;
+	return NSVG_BLEND_NORMAL;
+}
+
 static unsigned char nsvg__parsePaintOrder(const char* str)
 {
 	if (strcmp(str, "normal") == 0 || strcmp(str, "fill stroke markers") == 0)
@@ -1922,6 +1977,10 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
 		attr->paintOrder = nsvg__parsePaintOrder(value);
+	} else if (strcmp(name, "mix-blend-mode") == 0) {
+		attr->blendMode = nsvg__parseBlendMode(value);
+	} else if (strcmp(name, "isolation") == 0) {
+		attr->isolation = (strcmp(value, "isolate") == 0) ? NSVG_ISOLATION_ISOLATE : NSVG_ISOLATION_AUTO;
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -2854,6 +2913,21 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 	if (strcmp(el, "g") == 0) {
 		nsvg__pushAttr(p);
 		nsvg__parseAttribs(p, attr);
+		{
+			NSVGattrib* ga = nsvg__getAttr(p);
+			// A group with mix-blend-mode other than normal is forced to be isolated,
+			// and the whole group is blended with the backdrop using that mode.
+			if (ga->blendMode != NSVG_BLEND_NORMAL)
+				ga->isolation = NSVG_ISOLATION_ISOLATE;
+			if (ga->isolation == NSVG_ISOLATION_ISOLATE) {
+				ga->isolateGroup = ++p->isolateGroupNext;
+				ga->groupBlendMode = ga->blendMode;
+				// Neither property is inherited: the blend mode applies to the
+				// group layer as a whole, not to the group's children.
+				ga->blendMode = NSVG_BLEND_NORMAL;
+				ga->isolation = NSVG_ISOLATION_AUTO;
+			}
+		}
 	} else if (strcmp(el, "path") == 0) {
 		if (p->pathFlag)	// Do not allow nested paths.
 			return;
