@@ -446,6 +446,7 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char filter[64];
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -454,6 +455,41 @@ typedef struct NSVGstyleDeclaration
 	char* propertiesText;
 	struct NSVGstyleDeclaration* next;
 } NSVGstyleDeclaration;
+
+// feSpecularLighting filter primitive state, and the shapes that reference it.
+// NanoSVG has no filter pipeline, so the primitive is resolved at parse time
+// into a radial-gradient highlight layered on top of the filtered shape.
+enum NSVGlightType {
+	NSVG_LIGHT_NONE = 0,
+	NSVG_LIGHT_DISTANT = 1,
+	NSVG_LIGHT_POINT = 2,
+	NSVG_LIGHT_SPOT = 3
+};
+
+typedef struct NSVGspecularFilter
+{
+	char id[64];
+	char containerId[64];
+	char in[64];
+	signed char lightType;
+	float surfaceScale;
+	float specularConstant;
+	float specularExponent;
+	unsigned int lightingColor;
+	float azimuth;
+	float elevation;
+	float lx, ly, lz;
+	float pointsAtX, pointsAtY, pointsAtZ;
+	char hasIn;
+	struct NSVGspecularFilter* next;
+} NSVGspecularFilter;
+
+typedef struct NSVGspecularUse
+{
+	char filterId[64];
+	struct NSVGshape* shape;
+	struct NSVGspecularUse* next;
+} NSVGspecularUse;
 
 typedef struct NSVGparser
 {
@@ -466,6 +502,10 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGspecularFilter* specFilters;
+	NSVGspecularUse* specUses;
+	NSVGspecularFilter* curSpecFilter;
+	char curFilterId[64];
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -712,12 +752,34 @@ static void nsvg__deleteGradientData(NSVGgradientData* grad)
 	}
 }
 
+static void nsvg__deleteSpecFilters(NSVGspecularFilter* filter)
+{
+	NSVGspecularFilter* next;
+	while (filter != NULL) {
+		next = filter->next;
+		free(filter);
+		filter = next;
+	}
+}
+
+static void nsvg__deleteSpecUses(NSVGspecularUse* use)
+{
+	NSVGspecularUse* next;
+	while (use != NULL) {
+		next = use->next;
+		free(use);
+		use = next;
+	}
+}
+
 static void nsvg__deleteParser(NSVGparser* p)
 {
 	if (p != NULL) {
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		nsvg__deleteSpecFilters(p->specFilters);
+		nsvg__deleteSpecUses(p->specUses);
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -1053,6 +1115,18 @@ static void nsvg__addShape(NSVGparser* p)
 	else
 		p->shapesTail->next = shape;
 	p->shapesTail = shape;
+
+	// Track feSpecularLighting filters referenced by this shape.
+	if (attr->filter[0] != '\0') {
+		NSVGspecularUse* use = (NSVGspecularUse*)malloc(sizeof(NSVGspecularUse));
+		if (use != NULL) {
+			strncpy(use->filterId, attr->filter, 63);
+			use->filterId[63] = '\0';
+			use->shape = shape;
+			use->next = p->specUses;
+			p->specUses = use;
+		}
+	}
 
 	return;
 
@@ -1927,6 +2001,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->id[63] = '\0';
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filter, value);
 	}
 	else {
 		return 0;
@@ -2833,21 +2910,173 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+// ---- feSpecularLighting / filter support ----------------------------------
+
+static NSVGspecularFilter* nsvg__findSpecFilter(NSVGparser* p, const char* id)
+{
+	NSVGspecularFilter* filter;
+	for (filter = p->specFilters; filter != NULL; filter = filter->next) {
+		if (strcmp(filter->id, id) == 0 ||
+		    (filter->containerId[0] != '\0' && strcmp(filter->containerId, id) == 0))
+			return filter;
+	}
+	return NULL;
+}
+
+static void nsvg__parseSpecularLighting(NSVGparser* p, const char** attr)
+{
+	NSVGspecularFilter* filter;
+	int i;
+
+	filter = (NSVGspecularFilter*)malloc(sizeof(NSVGspecularFilter));
+	if (filter == NULL) return;
+	memset(filter, 0, sizeof(NSVGspecularFilter));
+	// SVG defaults.
+	filter->surfaceScale = 1.0f;
+	filter->specularConstant = 1.0f;
+	filter->specularExponent = 1.0f;
+	filter->lightingColor = NSVG_RGB(255, 255, 255);
+	filter->lightType = NSVG_LIGHT_NONE;
+	filter->pointsAtZ = 0.0f;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(filter->id, attr[i+1], 63);
+			filter->id[63] = '\0';
+		} else if (strcmp(attr[i], "in") == 0) {
+			strncpy(filter->in, attr[i+1], 63);
+			filter->in[63] = '\0';
+			filter->hasIn = 1;
+		} else if (strcmp(attr[i], "surfaceScale") == 0) {
+			filter->surfaceScale = (float)nsvg__atof(attr[i+1]);
+		} else if (strcmp(attr[i], "specularConstant") == 0) {
+			filter->specularConstant = (float)nsvg__atof(attr[i+1]);
+		} else if (strcmp(attr[i], "specularExponent") == 0) {
+			filter->specularExponent = (float)nsvg__atof(attr[i+1]);
+		} else if (strcmp(attr[i], "lighting-color") == 0) {
+			filter->lightingColor = nsvg__parseColor(attr[i+1]);
+		}
+	}
+
+	// Shape filter attributes reference the parent <filter> container id,
+	// while the primitive may carry its own id. Remember the container id so
+	// the lookup can match either one.
+	if (filter->id[0] == '\0' && p->curFilterId[0] != '\0') {
+		strncpy(filter->id, p->curFilterId, 63);
+		filter->id[63] = '\0';
+	}
+	strncpy(filter->containerId, p->curFilterId, 63);
+	filter->containerId[63] = '\0';
+
+	p->curSpecFilter = filter;
+	filter->next = p->specFilters;
+	p->specFilters = filter;
+}
+
+static void nsvg__parseDistantLight(NSVGparser* p, const char** attr)
+{
+	NSVGspecularFilter* filter = p->curSpecFilter;
+	int i;
+	if (filter == NULL) return;
+	filter->lightType = NSVG_LIGHT_DISTANT;
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "azimuth") == 0)
+			filter->azimuth = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "elevation") == 0)
+			filter->elevation = (float)nsvg__atof(attr[i+1]);
+	}
+}
+
+static void nsvg__parsePointLight(NSVGparser* p, const char** attr)
+{
+	NSVGspecularFilter* filter = p->curSpecFilter;
+	int i;
+	if (filter == NULL) return;
+	filter->lightType = NSVG_LIGHT_POINT;
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "x") == 0)
+			filter->lx = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "y") == 0)
+			filter->ly = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "z") == 0)
+			filter->lz = (float)nsvg__atof(attr[i+1]);
+	}
+}
+
+static void nsvg__parseSpotLight(NSVGparser* p, const char** attr)
+{
+	NSVGspecularFilter* filter = p->curSpecFilter;
+	int i;
+	if (filter == NULL) return;
+	filter->lightType = NSVG_LIGHT_SPOT;
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "x") == 0)
+			filter->lx = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "y") == 0)
+			filter->ly = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "z") == 0)
+			filter->lz = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "pointsAtX") == 0)
+			filter->pointsAtX = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "pointsAtY") == 0)
+			filter->pointsAtY = (float)nsvg__atof(attr[i+1]);
+		else if (strcmp(attr[i], "pointsAtZ") == 0)
+			filter->pointsAtZ = (float)nsvg__atof(attr[i+1]);
+	}
+}
+
+// Returns 1 when the 'in' attribute of a filter references a source the
+// renderer can produce (implicit source / SourceGraphic / SourceAlpha).
+static int nsvg__specInputAvailable(NSVGspecularFilter* filter)
+{
+	if (!filter->hasIn || filter->in[0] == '\0')
+		return 1;
+	if (strcmp(filter->in, "SourceGraphic") == 0 ||
+	    strcmp(filter->in, "SourceAlpha") == 0)
+		return 1;
+	return 0;
+}
+
+// Extracts the value of the "id" attribute from an XML attribute list.
+static const char* nsvg__findAttrId(const char** attr)
+{
+	int i;
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0)
+			return attr[i+1];
+	}
+	return NULL;
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
 	if (p->defsFlag) {
-		// Skip everything but gradients and styles in defs
+		// Skip everything but gradients, filters and styles in defs.
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
 		} else if (strcmp(el, "radialGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 		} else if (strcmp(el, "stop") == 0) {
 			nsvg__parseGradientStop(p, attr);
-		} else if (strcmp(el, "style") == 0) {
+		} else if (strcmp(el, "filter") == 0) {
+			const char* id = nsvg__findAttrId(attr);
+			p->curFilterId[0] = '\0';
+			if (id != NULL) {
+				strncpy(p->curFilterId, id, 63);
+				p->curFilterId[63] = '\0';
+			}
+		} else if (strcmp(el, "feSpecularLighting") == 0) {
+			nsvg__parseSpecularLighting(p, attr);
+		} else if (strcmp(el, "feDistantLight") == 0) {
+			nsvg__parseDistantLight(p, attr);
+		} else if (strcmp(el, "fePointLight") == 0) {
+			nsvg__parsePointLight(p, attr);
+		} else if (strcmp(el, "feSpotLight") == 0) {
+			nsvg__parseSpotLight(p, attr);
+		} else if (strcmp(el, "style") == 0)
 			p->styleFlag = 1;
-		}
 		return;
 	}
 
@@ -2890,6 +3119,21 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 	} else if (strcmp(el, "stop") == 0) {
 		nsvg__parseGradientStop(p, attr);
+	} else if (strcmp(el, "filter") == 0) {
+		const char* id = nsvg__findAttrId(attr);
+		p->curFilterId[0] = '\0';
+		if (id != NULL) {
+			strncpy(p->curFilterId, id, 63);
+			p->curFilterId[63] = '\0';
+		}
+	} else if (strcmp(el, "feSpecularLighting") == 0) {
+		nsvg__parseSpecularLighting(p, attr);
+	} else if (strcmp(el, "feDistantLight") == 0) {
+		nsvg__parseDistantLight(p, attr);
+	} else if (strcmp(el, "fePointLight") == 0) {
+		nsvg__parsePointLight(p, attr);
+	} else if (strcmp(el, "feSpotLight") == 0) {
+		nsvg__parseSpotLight(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
 	} else if (strcmp(el, "svg") == 0) {
@@ -2907,6 +3151,8 @@ static void nsvg__endElement(void* ud, const char* el)
 		nsvg__popAttr(p);
 	} else if (strcmp(el, "path") == 0) {
 		p->pathFlag = 0;
+	} else if (strcmp(el, "feSpecularLighting") == 0) {
+		p->curSpecFilter = NULL;
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
@@ -3170,6 +3416,188 @@ static void nsvg__createGradients(NSVGparser* p)
 	}
 }
 
+// ---- feSpecularLighting resolution ----------------------------------------
+
+// Direction from the shaded object toward the light source, normalized.
+static void nsvg__lightDirection(NSVGspecularFilter* f, const float* center, float* dir)
+{
+	if (f->lightType == NSVG_LIGHT_DISTANT) {
+		float az = f->azimuth * NSVG_PI / 180.0f;
+		float el = f->elevation * NSVG_PI / 180.0f;
+		// SVG feDistantLight frame: +x right, +y up, +z toward the viewer.
+		// The renderer's y axis points down. Azimuth is measured clockwise
+		// from the +x axis in that frame; converting to screen coordinates
+		// negates both planar components.
+		dir[0] = -cosf(el) * cosf(az);
+		dir[1] = cosf(el) * sinf(az);
+		dir[2] = sinf(el);
+	} else {
+		float dx, dy, dz, invLen;
+		if (f->lightType == NSVG_LIGHT_SPOT) {
+			// Beam axis: from the light position toward the target point.
+			dx = f->pointsAtX - f->lx;
+			dy = f->pointsAtY - f->ly;
+			dz = f->pointsAtZ - f->lz;
+		} else {
+			// Point light: direction from the object toward the light.
+			dx = f->lx - center[0];
+			dy = f->ly - center[1];
+			dz = f->lz;
+		}
+		invLen = sqrtf(dx*dx + dy*dy + dz*dz);
+		if (invLen > 1e-6f) invLen = 1.0f / invLen;
+		else invLen = 0.0f;
+		dir[0] = dx * invLen;
+		// Point/spot x,y live in the same y-down user space as the geometry.
+		dir[1] = dy * invLen;
+		dir[2] = dz * invLen;
+	}
+}
+
+// Builds the radial gradient paint used for one specular highlight.
+static NSVGgradient* nsvg__createSpecularGradient(NSVGspecularFilter* f, float cx, float cy, float radius)
+{
+	enum { NSTOPS = 8 };
+	NSVGgradient* grad;
+	unsigned int rgb = f->lightingColor & 0x00ffffffu;
+	int peakAlpha, i;
+
+	if (radius < 0.5f) radius = 0.5f;
+
+	grad = (NSVGgradient*)malloc(sizeof(NSVGgradient) + sizeof(NSVGgradientStop)*(NSTOPS-1));
+	if (grad == NULL) return NULL;
+
+	// Radial gradient transform maps normalized device distance back to pixels.
+	grad->xform[0] = 1.0f / radius; grad->xform[1] = 0.0f;
+	grad->xform[2] = 0.0f;          grad->xform[3] = 1.0f / radius;
+	grad->xform[4] = -cx / radius;  grad->xform[5] = -cy / radius;
+	grad->spread = NSVG_SPREAD_PAD;
+	grad->fx = 0.0f;
+	grad->fy = 0.0f;
+	grad->nstops = NSTOPS;
+
+	// specularConstant alone sets the peak intensity; clamp to a valid alpha.
+	peakAlpha = (int)(f->specularConstant * 255.0f);
+	if (peakAlpha < 0) peakAlpha = 0;
+	if (peakAlpha > 255) peakAlpha = 255;
+
+	// Alpha falls off as (1-t)^exponent, which is exactly the Blinn-Phong
+	// cosine power applied to the angle between the normal and half vector.
+	for (i = 0; i < NSTOPS; i++) {
+		float t = (float)i / (float)(NSTOPS-1);
+		float falloff = powf(1.0f - t, nsvg__maxf(f->specularExponent, 0.0f));
+		int alpha = (int)(peakAlpha * falloff);
+		grad->stops[i].offset = t;
+		grad->stops[i].color = rgb | ((unsigned int)alpha << 24);
+	}
+
+	return grad;
+}
+
+// Replicates every path of 'src' into a fresh path list for the highlight shape.
+static NSVGpath* nsvg__cloneSpecularPaths(NSVGshape* src)
+{
+	NSVGpath* out = NULL;
+	NSVGpath* tail = NULL;
+	NSVGpath* path;
+
+	for (path = src->paths; path != NULL; path = path->next) {
+		NSVGpath* copy = (NSVGpath*)malloc(sizeof(NSVGpath));
+		if (copy == NULL) {
+			nsvg__deletePaths(out);
+			return NULL;
+		}
+		memset(copy, 0, sizeof(NSVGpath));
+		copy->npts = path->npts;
+		copy->closed = path->closed;
+		memcpy(copy->bounds, path->bounds, sizeof(copy->bounds));
+		copy->pts = (float*)malloc(path->npts * 2 * sizeof(float));
+		if (copy->pts == NULL) {
+			free(copy);
+			nsvg__deletePaths(out);
+			return NULL;
+		}
+		memcpy(copy->pts, path->pts, path->npts * 2 * sizeof(float));
+		copy->next = NULL;
+
+		if (tail == NULL) out = copy;
+		else tail->next = copy;
+		tail = copy;
+	}
+	return out;
+}
+
+// For every shape referencing an feSpecularLighting filter, layers a clipped
+// radial-gradient highlight on top of it. Filters without a usable light
+// source or referencing a missing input produce no highlight at all.
+static void nsvg__createSpecularHighlights(NSVGparser* p)
+{
+	NSVGspecularUse* use;
+
+	use = p->specUses;
+	while (use != NULL) {
+		NSVGspecularUse* nextUse = use->next;
+		NSVGspecularFilter* filter = nsvg__findSpecFilter(p, use->filterId);
+		if (filter != NULL &&
+		    filter->lightType != NSVG_LIGHT_NONE &&
+		    nsvg__specInputAvailable(filter)) {
+			NSVGshape* base = use->shape;
+			NSVGshape* hi;
+			NSVGgradient* grad;
+			NSVGpath* paths;
+			float center[3], dir[3], size[2], offset[2], radius;
+
+			center[0] = (base->bounds[0] + base->bounds[2]) * 0.5f;
+			center[1] = (base->bounds[1] + base->bounds[3]) * 0.5f;
+			center[2] = 0.0f;
+			size[0] = base->bounds[2] - base->bounds[0];
+			size[1] = base->bounds[3] - base->bounds[1];
+
+			nsvg__lightDirection(filter, center, dir);
+
+			// Shift the hotspot toward the light, keeping it inside the shape.
+			offset[0] = dir[0] * size[0] * 0.32f;
+			offset[1] = dir[1] * size[1] * 0.32f;
+
+			// Larger exponents (and surfaceScale) converge the highlight.
+			radius = sqrtf(size[0]*size[0] + size[1]*size[1]) * 0.5f;
+			// Keep the spot several pixels wide even for large exponents so
+			// the peak coverage is not lost; it still shrinks monotonically.
+			radius /= (1.0f + 0.06f * nsvg__maxf(filter->specularExponent, 0.0f))
+			          * (1.0f + 0.15f * nsvg__maxf(filter->surfaceScale, 0.0f));
+			if (radius < 4.0f) radius = 4.0f;
+
+			grad = nsvg__createSpecularGradient(filter, center[0] + offset[0],
+			                                     center[1] + offset[1], radius);
+			paths = (grad != NULL) ? nsvg__cloneSpecularPaths(base) : NULL;
+			hi = (paths != NULL) ? (NSVGshape*)malloc(sizeof(NSVGshape)) : NULL;
+
+			if (hi != NULL) {
+				memset(hi, 0, sizeof(NSVGshape));
+				hi->paths = paths;
+				memcpy(hi->bounds, base->bounds, sizeof(hi->bounds));
+				hi->xform[0] = 1.0f; hi->xform[3] = 1.0f;
+				hi->opacity = 1.0f;
+				hi->fillRule = base->fillRule;
+				hi->paintOrder = base->paintOrder;
+				hi->flags = NSVG_FLAGS_VISIBLE;
+				hi->fill.type = NSVG_PAINT_RADIAL_GRADIENT;
+				hi->fill.gradient = grad;
+				hi->stroke.type = NSVG_PAINT_NONE;
+
+				// Insert immediately after the base shape to overlay only it.
+				hi->next = base->next;
+				base->next = hi;
+			} else {
+				if (paths != NULL) nsvg__deletePaths(paths);
+				if (grad != NULL) free(grad);
+			}
+		}
+
+		use = nextUse;
+	}
+}
+
 NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 {
 	NSVGparser* p;
@@ -3188,6 +3616,10 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 
 	// Scale to viewBox
 	nsvg__scaleToViewbox(p, units);
+
+	// Resolve feSpecularLighting filters into highlight shapes. The shapes
+	// carry coordinates in the final (viewBox-scaled) frame at this point.
+	nsvg__createSpecularHighlights(p);
 
 	ret = p->image;
 	p->image = NULL;
