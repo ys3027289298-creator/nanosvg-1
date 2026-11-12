@@ -1,0 +1,4 @@
+line    duty: measured 0.666 theory 0.667 dev -0.0010 | pattern match 98.5%
+circle  duty: measured 0.682 theory 0.667 dev +0.0150 | pattern match 99.1%
+bezier  duty: measured 0.758 theory 0.750 dev +0.0076 | pattern match 98.4%
+offset  duty: measured 0.665 theory 0.667 dev -0.0020 | pattern match 98.3%
