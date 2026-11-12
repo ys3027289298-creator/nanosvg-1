@@ -112,6 +112,14 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+// Image rendering mode, set with the 'image-rendering' attribute on the root <svg> element.
+// Controls how the rasterizer samples the image when a scale other than 1 is used.
+enum NSVGimageRendering {
+	NSVG_IMAGE_RENDERING_AUTO = 0,			// Default, rasterize directly at the requested scale.
+	NSVG_IMAGE_RENDERING_OPTIMIZE_SPEED = 1,	// Same as NSVG_IMAGE_RENDERING_AUTO.
+	NSVG_IMAGE_RENDERING_PIXELATED = 2,		// Rasterize at 1:1 and nearest-neighbor sample to the requested scale.
+};
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -171,6 +179,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	char imageRendering;		// Image rendering mode, one of NSVGimageRendering (from 'image-rendering' attribute).
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -1927,6 +1936,13 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->id[63] = '\0';
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
+	} else if (strcmp(name, "image-rendering") == 0) {
+		if (strcmp(value, "pixelated") == 0)
+			p->image->imageRendering = NSVG_IMAGE_RENDERING_PIXELATED;
+		else if (strcmp(value, "optimizeSpeed") == 0)
+			p->image->imageRendering = NSVG_IMAGE_RENDERING_OPTIMIZE_SPEED;
+		else if (strcmp(value, "auto") == 0)
+			p->image->imageRendering = NSVG_IMAGE_RENDERING_AUTO;
 	}
 	else {
 		return 0;

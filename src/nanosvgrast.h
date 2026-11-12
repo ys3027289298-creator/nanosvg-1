@@ -1372,6 +1372,54 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+// Rasterizes the image at 1:1 scale into a temporary buffer and samples it
+// with nearest-neighbor into the destination, giving a crisp "pixelated" look
+// when the requested scale is not 1.
+static void nsvg__rasterizePixelated(NSVGrasterizer* r, NSVGimage* image, float tx, float ty, float scale,
+									 unsigned char* dst, int w, int h, int stride)
+{
+	// Source pixel (i,j) of the 1:1 image covers the unit square [i,i+1] x [j,j+1].
+	// Compute the range of source pixels visible through the destination rectangle.
+	int x0 = (int)floorf((0.0f - tx) / scale);
+	int y0 = (int)floorf((0.0f - ty) / scale);
+	int x1 = (int)ceilf(((float)w - tx) / scale);
+	int y1 = (int)ceilf(((float)h - ty) / scale);
+	int tw = x1 - x0;
+	int th = y1 - y0;
+	unsigned char* tmp = NULL;
+	int x, y;
+
+	if (tw <= 0 || th <= 0) return;
+	tmp = (unsigned char*)malloc((size_t)tw * (size_t)th * 4);
+	if (tmp == NULL) return;
+
+	// Render so that source pixel (x0,y0) lands at temp pixel (0,0).
+	nsvgRasterize(r, image, -(float)x0, -(float)y0, 1.0f, tmp, tw, th, tw * 4);
+
+	for (y = 0; y < h; y++) {
+		unsigned char* drow = &dst[y * stride];
+		int sy = (int)floorf(((float)y - ty) / scale) - y0;
+		const unsigned char* srow;
+		if (sy < 0) sy = 0;
+		if (sy > th - 1) sy = th - 1;
+		srow = &tmp[sy * tw * 4];
+		for (x = 0; x < w; x++) {
+			int sx = (int)floorf(((float)x - tx) / scale) - x0;
+			const unsigned char* s;
+			if (sx < 0) sx = 0;
+			if (sx > tw - 1) sx = tw - 1;
+			s = &srow[sx * 4];
+			drow[0] = s[0];
+			drow[1] = s[1];
+			drow[2] = s[2];
+			drow[3] = s[3];
+			drow += 4;
+		}
+	}
+
+	free(tmp);
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
@@ -1387,6 +1435,11 @@ void nsvgRasterize(NSVGrasterizer* r,
 	r->width = w;
 	r->height = h;
 	r->stride = stride;
+
+	if (image->imageRendering == NSVG_IMAGE_RENDERING_PIXELATED && scale != 1.0f) {
+		nsvg__rasterizePixelated(r, image, tx, ty, scale, dst, w, h, stride);
+		return;
+	}
 
 	if (w > r->cscanline) {
 		r->cscanline = w;
