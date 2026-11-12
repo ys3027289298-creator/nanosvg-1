@@ -146,6 +146,9 @@ struct NSVGrasterizer
 	unsigned char* scanline;
 	int cscanline;
 
+	unsigned char* morphBuffer;	// Temp RGBA buffer for feMorphology
+	int cmorphBuffer;
+
 	unsigned char* bitmap;
 	int width, height, stride;
 };
@@ -183,6 +186,7 @@ void nsvgDeleteRasterizer(NSVGrasterizer* r)
 	if (r->points) free(r->points);
 	if (r->points2) free(r->points2);
 	if (r->scanline) free(r->scanline);
+	if (r->morphBuffer) free(r->morphBuffer);
 
 	free(r);
 }
@@ -1372,6 +1376,90 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+// Applies an feMorphology erode/dilate pass using a circular structuring
+// element. Pixels with a source alpha of 0 never contribute to dilation.
+static void nsvg__morphology(NSVGrasterizer* r, NSVGimage* image, float scale,
+							 unsigned char* dst, int w, int h, int stride)
+{
+	NSVGshape* shape;
+	int op = 0;
+	int radius = 0;
+	int size, x, y, k;
+
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		if (shape->morphOperator != 0 && shape->morphRadius > 0.0f) {
+			op = shape->morphOperator;
+			radius = (int)(shape->morphRadius * scale + 0.5f);
+			break;
+		}
+	}
+
+	// Nothing to do: keep the output untouched.
+	if (op == 0 || radius <= 0)
+		return;
+
+	size = stride * h;
+	if (r->cmorphBuffer < size) {
+		unsigned char* tmp = (unsigned char*)realloc(r->morphBuffer, size);
+		if (tmp == NULL) return;
+		r->morphBuffer = tmp;
+		r->cmorphBuffer = size;
+	}
+	memcpy(r->morphBuffer, dst, size);
+
+	// Build the circular structuring element (integer pixel offsets).
+	{
+	int offx[1024], offy[1024];
+	int noffsets = 0;
+	int dy, dx;
+	for (dy = -radius; dy <= radius; dy++) {
+		for (dx = -radius; dx <= radius; dx++) {
+			if (dx*dx + dy*dy <= radius*radius && noffsets < 1024)
+			{
+				offx[noffsets] = dx;
+				offy[noffsets] = dy;
+				noffsets++;
+			}
+		}
+	}
+
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			unsigned char* out = &dst[y*stride + x*4];
+			if (op == 2) {
+				// Dilate: pick the max-alpha neighbor; alpha-0 pixels
+				// are transparent and never contribute.
+				unsigned char best[4] = {0, 0, 0, 0};
+				for (k = 0; k < noffsets; k++) {
+					int sx = x + offx[k];
+					int sy = y + offy[k];
+					const unsigned char* src;
+					if (sx < 0 || sx >= w || sy < 0 || sy >= h)
+						continue;
+					src = &r->morphBuffer[sy*stride + sx*4];
+					if (src[3] > best[3])
+						memcpy(best, src, 4);
+				}
+				memcpy(out, best, 4);
+			} else {
+				// Erode: keep the center only when every neighbor is
+				// inside the image and fully covered (alpha > 0).
+				int covered = 1;
+				for (k = 0; k < noffsets && covered; k++) {
+					int sx = x + offx[k];
+					int sy = y + offy[k];
+					if (sx < 0 || sx >= w || sy < 0 || sy >= h ||
+						r->morphBuffer[sy*stride + sx*4 + 3] == 0)
+						covered = 0;
+				}
+				if (!covered)
+					memset(out, 0, 4);
+			}
+		}
+	}
+	}
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
@@ -1460,6 +1548,9 @@ void nsvgRasterize(NSVGrasterizer* r,
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);
+
+	// Apply feMorphology (erode/dilate) defined on the rendered shapes.
+	nsvg__morphology(r, image, scale, dst, w, h, stride);
 
 	r->bitmap = NULL;
 	r->width = 0;

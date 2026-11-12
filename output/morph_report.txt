@@ -1,0 +1,5 @@
+case             pixels   bbox expand l,r,t,b (px)
+dilate_r2           564          (+2,+2,+2,+2)
+erode_r2           1296          (-2,-2,-2,-2)
+radius0             400          (+0,+0,+0,+0)
+regression       306053          (+0,+0,+0,+0)

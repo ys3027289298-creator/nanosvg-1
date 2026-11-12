@@ -147,6 +147,8 @@ typedef struct NSVGshape
 	char id[64];				// Optional 'id' attr of the shape or its group
 	NSVGpaint fill;				// Fill paint
 	NSVGpaint stroke;			// Stroke paint
+	char morphOperator;			// feMorphology: 1 = erode, 2 = dilate, 0 = none
+	float morphRadius;			// feMorphology radius in user units (0 disables)
 	float opacity;				// Opacity of the shape.
 	float strokeWidth;			// Stroke width (scaled).
 	float strokeDashOffset;		// Stroke dash offset (scaled).
@@ -419,10 +421,19 @@ typedef struct NSVGgradientData
 	struct NSVGgradientData* next;
 } NSVGgradientData;
 
+typedef struct NSVGmorphologyData
+{
+	char id[64];
+	char op;					// 1 = erode, 2 = dilate
+	float radius;
+	struct NSVGmorphologyData* next;
+} NSVGmorphologyData;
+
 typedef struct NSVGattrib
 {
 	char id[64];
 	float xform[6];
+	char filter[64];			// Optional 'id' referenced by the 'filter' attr
 	unsigned int fillColor;
 	unsigned int strokeColor;
 	float opacity;
@@ -466,6 +477,7 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGmorphologyData* morphologies;
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -473,6 +485,7 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	char filterId[64];			// Id of the filter currently being parsed
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -715,6 +728,12 @@ static void nsvg__deleteGradientData(NSVGgradientData* grad)
 static void nsvg__deleteParser(NSVGparser* p)
 {
 	if (p != NULL) {
+		NSVGmorphologyData* morph = p->morphologies;
+		while (morph != NULL) {
+			NSVGmorphologyData* next = morph->next;
+			free(morph);
+			morph = next;
+		}
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
@@ -1006,6 +1025,16 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->fillRule = attr->fillRule;
 	shape->opacity = attr->opacity;
     shape->paintOrder = attr->paintOrder;
+	{
+		NSVGmorphologyData* morph;
+		for (morph = p->morphologies; morph != NULL; morph = morph->next) {
+			if (attr->filter[0] != '\0' && strcmp(morph->id, attr->filter) == 0) {
+				shape->morphOperator = morph->op;
+				shape->morphRadius = morph->radius * scale;
+				break;
+			}
+		}
+	}
 
 	shape->paths = p->plist;
 	p->plist = NULL;
@@ -1925,6 +1954,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filter, value);
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
 	}
@@ -2847,6 +2879,35 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 			nsvg__parseGradientStop(p, attr);
 		} else if (strcmp(el, "style") == 0) {
 			p->styleFlag = 1;
+		} else if (strcmp(el, "filter") == 0) {
+			int i;
+			for (i = 0; attr[i]; i += 2) {
+				if (strcmp(attr[i], "id") == 0) {
+					strncpy(p->filterId, attr[i + 1], 63);
+					p->filterId[63] = '\0';
+				}
+			}
+		} else if (strcmp(el, "feMorphology") == 0) {
+			NSVGmorphologyData* morph;
+			int i;
+			morph = (NSVGmorphologyData*)malloc(sizeof(NSVGmorphologyData));
+			if (morph == NULL) return;
+			memset(morph, 0, sizeof(NSVGmorphologyData));
+			morph->radius = 0.0f;
+			strncpy(morph->id, p->filterId, 63);
+			morph->id[63] = '\0';
+			for (i = 0; attr[i]; i += 2) {
+				if (strcmp(attr[i], "operator") == 0) {
+					if (strcmp(attr[i + 1], "erode") == 0)
+						morph->op = 1;
+					else if (strcmp(attr[i + 1], "dilate") == 0)
+						morph->op = 2;
+				} else if (strcmp(attr[i], "radius") == 0) {
+					morph->radius = nsvg__parseCoordinateRaw(attr[i + 1]).value;
+				}
+			}
+			morph->next = p->morphologies;
+			p->morphologies = morph;
 		}
 		return;
 	}
@@ -2909,6 +2970,8 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->pathFlag = 0;
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 0;
+	} else if (strcmp(el, "filter") == 0) {
+		p->filterId[0] = '\0';
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
 	}
