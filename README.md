@@ -30,6 +30,10 @@ If you don't know or care about the units stuff, "px" and 96 should get you goin
 
 The parser library is accompanied with really simpler SVG rasterizer. Currently it only renders flat filled shapes.
 
+The rasterizer has basic support for `feSpecularLighting` with `fePointLight`: the light position (`x`/`y`/`z`)
+is read in SVG coordinates and converted to pixels in the filter coordinate system, attenuated by `1/(1+distance)`,
+and combined with Blinn-Phong specular so the highlight follows the light. See `tests/light/run.sh` for examples.
+
 The intended usage for the rasterizer is to for example bake icons of different size into a texture. The rasterizer is not particular fast or accurate, but it's small and packed in one header file.
 
 

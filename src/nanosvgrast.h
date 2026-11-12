@@ -116,6 +116,7 @@ typedef struct NSVGmemPage {
 typedef struct NSVGcachedPaint {
 	signed char type;
 	char spread;
+	char colorInterpolation;	// Space for AA compositing, see NSVG_COLOR_INTERPOLATION_*.
 	float xform[6];
 	unsigned int colors[256];
 } NSVGcachedPaint;
@@ -963,6 +964,46 @@ static float nsvg__clampf(float a, float mn, float mx) {
 	return a < mn ? mn : (a > mx ? mx : a);
 }
 
+// sRGB transfer function (IEC 61966-2-1), used for 'color-interpolation: linearRGB'.
+static float nsvg__srgbToLinear(float c)
+{
+	return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static float nsvg__linearToSRGB(float c)
+{
+	return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// Per-channel lookup tables for blending 8-bit bitmaps in linear light.
+// The decode table stores exact linear values; the encode table is quantized
+// to 12 bits (max error ~0.2/255, below the rounding of one output level).
+#define NSVG__L2S_BITS 12
+#define NSVG__L2S_SIZE (1 << NSVG__L2S_BITS)
+static float nsvg__srgb2lin[256];
+static unsigned char nsvg__lin2srgb[NSVG__L2S_SIZE];
+static int nsvg__colorTablesReady = 0;
+
+static void nsvg__initColorTables(void)
+{
+	int i;
+	if (nsvg__colorTablesReady) return;
+	for (i = 0; i < 256; i++)
+		nsvg__srgb2lin[i] = nsvg__srgbToLinear((float)i / 255.0f);
+	for (i = 0; i < NSVG__L2S_SIZE; i++) {
+		float v = nsvg__linearToSRGB((float)i / (float)(NSVG__L2S_SIZE - 1));
+		int q = (int)(nsvg__clampf(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+		nsvg__lin2srgb[i] = (unsigned char)q;
+	}
+	nsvg__colorTablesReady = 1;
+}
+
+static unsigned char nsvg__encodeLinear(float c)
+{
+	int q = (int)(nsvg__clampf(c, 0.0f, 1.0f) * (NSVG__L2S_SIZE - 1) + 0.5f);
+	return nsvg__lin2srgb[q];
+}
+
 static unsigned int nsvg__RGBA(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
 {
 	return ((unsigned int)r) | ((unsigned int)g << 8) | ((unsigned int)b << 16) | ((unsigned int)a << 24);
@@ -975,6 +1016,25 @@ static unsigned int nsvg__lerpRGBA(unsigned int c0, unsigned int c1, float u)
 	int g = (((c0>>8) & 0xff)*(256-iu) + (((c1>>8) & 0xff)*iu)) >> 8;
 	int b = (((c0>>16) & 0xff)*(256-iu) + (((c1>>16) & 0xff)*iu)) >> 8;
 	int a = (((c0>>24) & 0xff)*(256-iu) + (((c1>>24) & 0xff)*iu)) >> 8;
+	return nsvg__RGBA((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a);
+}
+
+// Interpolates two stop colors in linear light (RGB only; alpha is not a
+// color channel and stays in the encoded domain, matching SVG compositing).
+static unsigned int nsvg__lerpRGBALinear(unsigned int c0, unsigned int c1, float u)
+{
+	int r, g, b, a;
+	u = nsvg__clampf(u, 0.0f, 1.0f);
+	r = (int)(nsvg__linearToSRGB(nsvg__srgbToLinear((float)(c0 & 0xff) / 255.0f) * (1.0f - u) +
+	                            nsvg__srgbToLinear((float)(c1 & 0xff) / 255.0f) * u) * 255.0f + 0.5f);
+	g = (int)(nsvg__linearToSRGB(nsvg__srgbToLinear((float)((c0 >> 8) & 0xff) / 255.0f) * (1.0f - u) +
+	                            nsvg__srgbToLinear((float)((c1 >> 8) & 0xff) / 255.0f) * u) * 255.0f + 0.5f);
+	b = (int)(nsvg__linearToSRGB(nsvg__srgbToLinear((float)((c0 >> 16) & 0xff) / 255.0f) * (1.0f - u) +
+	                            nsvg__srgbToLinear((float)((c1 >> 16) & 0xff) / 255.0f) * u) * 255.0f + 0.5f);
+	{
+		int iu = (int)(u * 256.0f);
+		a = ((((c0>>24) & 0xff)*(256-iu)) + (((c1>>24) & 0xff)*iu)) >> 8;
+	}
 	return nsvg__RGBA((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a);
 }
 
@@ -993,6 +1053,23 @@ static inline int nsvg__div255(int x)
     return ((x+1) * 257) >> 16;
 }
 
+// Premultiplied "over" of one pixel in linear light. Coverage and alpha stay
+// encoded (alpha is not color-managed); RGB is linearized, blended there, and
+// converted back (SVG 'color-interpolation: linearRGB').
+static void nsvg__blendPixelLinear(unsigned char* dst, int cr, int cg, int cb, int a)
+{
+	float af = (float)a / 255.0f;
+	float invA = 1.0f - af;
+	float dr = nsvg__srgb2lin[dst[0]] * invA + nsvg__srgb2lin[cr] * af;
+	float dg = nsvg__srgb2lin[dst[1]] * invA + nsvg__srgb2lin[cg] * af;
+	float db = nsvg__srgb2lin[dst[2]] * invA + nsvg__srgb2lin[cb] * af;
+	int da = a + nsvg__div255((255 - a) * (int)dst[3]);
+	dst[0] = nsvg__encodeLinear(dr);
+	dst[1] = nsvg__encodeLinear(dg);
+	dst[2] = nsvg__encodeLinear(db);
+	dst[3] = (unsigned char)da;
+}
+
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
@@ -1005,24 +1082,28 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		ca = (cache->colors[0] >> 24) & 0xff;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b;
 			int a = nsvg__div255((int)cover[0] * ca);
-			int ia = 255 - a;
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
+			if (cache->colorInterpolation == NSVG_COLOR_INTERPOLATION_LINEAR_RGB) {
+				nsvg__blendPixelLinear(dst, cr, cg, cb, a);
+			} else {
+				int r,g,b;
+				int ia = 255 - a;
+				// Premultiply
+				r = nsvg__div255(cr * a);
+				g = nsvg__div255(cg * a);
+				b = nsvg__div255(cb * a);
 
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
+				// Blend over
+				r += nsvg__div255(ia * (int)dst[0]);
+				g += nsvg__div255(ia * (int)dst[1]);
+				b += nsvg__div255(ia * (int)dst[2]);
+				a += nsvg__div255(ia * (int)dst[3]);
 
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
+				dst[0] = (unsigned char)r;
+				dst[1] = (unsigned char)g;
+				dst[2] = (unsigned char)b;
+				dst[3] = (unsigned char)a;
+			}
 
 			cover++;
 			dst += 4;
@@ -1050,6 +1131,14 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 
 			a = nsvg__div255((int)cover[0] * ca);
 			ia = 255 - a;
+
+			if (cache->colorInterpolation == NSVG_COLOR_INTERPOLATION_LINEAR_RGB) {
+				nsvg__blendPixelLinear(dst, cr, cg, cb, a);
+				cover++;
+				dst += 4;
+				fx += dx;
+				continue;
+			}
 
 			// Premultiply
 			r = nsvg__div255(cr * a);
@@ -1097,6 +1186,14 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 
 			a = nsvg__div255((int)cover[0] * ca);
 			ia = 255 - a;
+
+			if (cache->colorInterpolation == NSVG_COLOR_INTERPOLATION_LINEAR_RGB) {
+				nsvg__blendPixelLinear(dst, cr, cg, cb, a);
+				cover++;
+				dst += 4;
+				fx += dx;
+				continue;
+			}
 
 			// Premultiply
 			r = nsvg__div255(cr * a);
@@ -1269,12 +1366,13 @@ static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int str
 }
 
 
-static void nsvg__initPaint(NSVGcachedPaint* cache, NSVGpaint* paint, float opacity)
+static void nsvg__initPaint(NSVGcachedPaint* cache, NSVGpaint* paint, float opacity, char colorInterpolation)
 {
 	int i, j;
 	NSVGgradient* grad;
 
 	cache->type = paint->type;
+	cache->colorInterpolation = colorInterpolation;
 
 	if (paint->type == NSVG_PAINT_COLOR) {
 		cache->colors[0] = nsvg__applyOpacity(paint->color, opacity);
@@ -1297,6 +1395,7 @@ static void nsvg__initPaint(NSVGcachedPaint* cache, NSVGpaint* paint, float opac
 		unsigned int ca, cb = 0;
 		float ua, ub, du, u;
 		int ia, ib, count;
+		int linearStops = grad->colorInterpolation == NSVG_COLOR_INTERPOLATION_LINEAR_RGB;
 
 		ca = nsvg__applyOpacity(grad->stops[0].color, opacity);
 		ua = nsvg__clampf(grad->stops[0].offset, 0, 1);
@@ -1319,7 +1418,7 @@ static void nsvg__initPaint(NSVGcachedPaint* cache, NSVGpaint* paint, float opac
 			u = 0;
 			du = 1.0f / (float)count;
 			for (j = 0; j < count; j++) {
-				cache->colors[ia+j] = nsvg__lerpRGBA(ca,cb,u);
+				cache->colors[ia+j] = linearStops ? nsvg__lerpRGBALinear(ca,cb,u) : nsvg__lerpRGBA(ca,cb,u);
 				u += du;
 			}
 		}
@@ -1372,6 +1471,54 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+// Applies feSpecularLighting with fePointLight to the covered pixels of a shape.
+// Light position is in the filter coordinate system (pixels). Uses distance
+// attenuation 1/(1+d) and Blinn-Phong specular so the highlight tracks the light.
+static void nsvg__applySpecularLighting(NSVGfilter* filter, float* bounds, float tx, float ty, float scale,
+										unsigned char* dst, int w, int h, int stride)
+{
+	int x, y, x0, y0, x1, y1;
+	float lz = filter->lightZ * filter->surfaceScale;
+	float lr = (float)(filter->lightColor & 0xff);
+	float lg = (float)((filter->lightColor >> 8) & 0xff);
+	float lb = (float)((filter->lightColor >> 16) & 0xff);
+
+	x0 = (int)(bounds[0] * scale + tx); if (x0 < 0) x0 = 0;
+	y0 = (int)(bounds[1] * scale + ty); if (y0 < 0) y0 = 0;
+	x1 = (int)(bounds[2] * scale + tx) + 1; if (x1 > w) x1 = w;
+	y1 = (int)(bounds[3] * scale + ty) + 1; if (y1 > h) y1 = h;
+
+	for (y = y0; y < y1; y++) {
+		float uy = ((float)y + 0.5f - ty) / scale;
+		float dy = filter->lightY - uy;
+		for (x = x0; x < x1; x++) {
+			unsigned char* px = &dst[y*stride + x*4];
+			float ux, dx, d, atten, hx, hy, hz, hl, nh, spec;
+			if (px[3] == 0) continue;
+			ux = ((float)x + 0.5f - tx) / scale;
+			dx = filter->lightX - ux;
+			d = sqrtf(dx*dx + dy*dy + lz*lz);
+			atten = 1.0f / (1.0f + d);
+			if (d > 1e-6f) {
+				hx = dx / d; hy = dy / d; hz = lz / d + 1.0f;	// half vector of L + V, V = (0,0,1)
+				hl = sqrtf(hx*hx + hy*hy + hz*hz);
+				nh = hz / hl;									// N.H with N = (0,0,1)
+			} else {
+				nh = 1.0f;
+			}
+			spec = filter->specularConstant * powf(nh, filter->specularExponent) * atten;
+			{
+				int pr = px[0] + (int)(lr * spec);
+				int pg = px[1] + (int)(lg * spec);
+				int pb = px[2] + (int)(lb * spec);
+				px[0] = (unsigned char)(pr > 255 ? 255 : pr);
+				px[1] = (unsigned char)(pg > 255 ? 255 : pg);
+				px[2] = (unsigned char)(pb > 255 ? 255 : pb);
+			}
+		}
+	}
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
@@ -1387,6 +1534,8 @@ void nsvgRasterize(NSVGrasterizer* r,
 	r->width = w;
 	r->height = h;
 	r->stride = stride;
+
+	nsvg__initColorTables();
 
 	if (w > r->cscanline) {
 		r->cscanline = w;
@@ -1425,7 +1574,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                     qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
 
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
-                nsvg__initPaint(&cache, &shape->fill, shape->opacity);
+                nsvg__initPaint(&cache, &shape->fill, shape->opacity, shape->colorInterpolation);
 
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
             }
@@ -1452,7 +1601,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                     qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
 
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
-                nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
+                nsvg__initPaint(&cache, &shape->stroke, shape->opacity, shape->colorInterpolation);
 
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
@@ -1460,6 +1609,16 @@ void nsvgRasterize(NSVGrasterizer* r,
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);
+
+	// Apply filter effects (feSpecularLighting + fePointLight) on covered pixels.
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		NSVGfilter* filter;
+		if (!(shape->flags & NSVG_FLAGS_VISIBLE) || shape->filter[0] == '\0')
+			continue;
+		filter = nsvgFindFilter(image, shape->filter);
+		if (filter != NULL)
+			nsvg__applySpecularLighting(filter, shape->bounds, tx, ty, scale, dst, w, h, stride);
+	}
 
 	r->bitmap = NULL;
 	r->width = 0;
