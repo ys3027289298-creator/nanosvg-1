@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="120" height="120" viewBox="0 0 120 120">
+  <rect x="0" y="0" width="120" height="120" fill="#ffffff"/>
+  <path id="curve" fill="none" stroke="#888888" d="M 10 60 C 40 10 80 10 110 60"/>
+  <text font-size="16" glyph-orientation-horizontal="auto">
+    <textPath xlink:href="#curve">ABCD</textPath>
+  </text>
+</svg>

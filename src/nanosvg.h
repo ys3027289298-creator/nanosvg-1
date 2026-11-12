@@ -166,11 +166,26 @@ typedef struct NSVGshape
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
 } NSVGshape;
 
+enum NSVGglyphOrientation {
+	NSVG_GLYPH_ORIENT_AUTO = -1,	// Orient glyph along the text path tangent.
+	NSVG_GLYPH_ORIENT_0 = 0,
+	NSVG_GLYPH_ORIENT_90 = 90
+};
+
+typedef struct NSVGglyph
+{
+	unsigned int codepoint;		// Unicode codepoint of the glyph.
+	float x, y;					// Glyph origin in image units (element transforms applied).
+	float rotate;				// Glyph rotation in degrees, element transforms included.
+	struct NSVGglyph* next;		// Pointer to next glyph, or NULL if last element.
+} NSVGglyph;
+
 typedef struct NSVGimage
 {
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGglyph* glyphs;			// Linked list of glyphs from <text> elements, or NULL.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -439,6 +454,9 @@ typedef struct NSVGattrib
 	float miterLimit;
 	char fillRule;
 	float fontSize;
+	signed char glyphOrientH;	// glyph-orientation-horizontal, see NSVGglyphOrientation
+	signed char glyphOrientV;	// glyph-orientation-vertical, see NSVGglyphOrientation
+	char writingMode;			// 0 = horizontal, 1 = vertical
 	unsigned int stopColor;
 	float stopOpacity;
 	float stopOffset;
@@ -473,6 +491,12 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	char textFlag;
+	float textX, textY;
+	char textPathId[64];
+	char textContent[2048];
+	int textContentLen;
+	NSVGglyph* glyphsTail;
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -663,6 +687,7 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].fillRule = NSVG_FILLRULE_NONZERO;
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
+	p->attr[0].glyphOrientV = NSVG_GLYPH_ORIENT_AUTO;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
 
 	return p;
@@ -1828,6 +1853,15 @@ static int nsvg__parseStrokeDashArray(NSVGparser* p, const char* str, float* str
 
 static void nsvg__parseStyle(NSVGparser* p, const char* str);
 
+static signed char nsvg__parseGlyphOrientation(const char* value)
+{
+	if (strcmp(value, "auto") == 0)
+		return NSVG_GLYPH_ORIENT_AUTO;
+	if (strncmp(value, "90", 2) == 0)
+		return NSVG_GLYPH_ORIENT_90;
+	return NSVG_GLYPH_ORIENT_0;
+}
+
 // Apply any matching class styles for a "class" attribute value. We support only simple class
 // selectors. The class attribute may contain multiple space-separated class names.
 static void nsvg__applyClassStyles(NSVGparser* p, const char* value)
@@ -1911,6 +1945,13 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->fillRule = nsvg__parseFillRule(value);
 	} else if (strcmp(name, "font-size") == 0) {
 		attr->fontSize = nsvg__parseCoordinate(p, value, 0.0f, nsvg__actualLength(p));
+	} else if (strcmp(name, "glyph-orientation-horizontal") == 0) {
+		attr->glyphOrientH = nsvg__parseGlyphOrientation(value);
+	} else if (strcmp(name, "glyph-orientation-vertical") == 0) {
+		attr->glyphOrientV = nsvg__parseGlyphOrientation(value);
+	} else if (strcmp(name, "writing-mode") == 0) {
+		if (strncmp(value, "vertical", 8) == 0 || strncmp(value, "tb", 2) == 0)
+			attr->writingMode = 1;
 	} else if (strcmp(name, "transform") == 0) {
 		nsvg__parseTransform(xform, value);
 		nsvg__xformPremultiply(attr->xform, xform);
@@ -2833,6 +2874,148 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+// Decode one UTF-8 codepoint, returns the codepoint and stores its byte length in 'n'.
+static unsigned int nsvg__utf8Decode(const char* s, int* n)
+{
+	const unsigned char* u = (const unsigned char*)s;
+	if (u[0] < 0x80) { *n = 1; return u[0]; }
+	if ((u[0] & 0xE0) == 0xC0) { *n = 2; return ((unsigned int)(u[0]&0x1F)<<6) | (u[1]&0x3F); }
+	if ((u[0] & 0xF0) == 0xE0) { *n = 3; return ((unsigned int)(u[0]&0x0F)<<12) | ((unsigned int)(u[1]&0x3F)<<6) | (u[2]&0x3F); }
+	if ((u[0] & 0xF8) == 0xF0) { *n = 4; return ((unsigned int)(u[0]&0x07)<<18) | ((unsigned int)(u[1]&0x3F)<<12) | ((unsigned int)(u[2]&0x3F)<<6) | (u[3]&0x3F); }
+	*n = 1;
+	return 0xFFFD;
+}
+
+static void nsvg__addGlyph(NSVGparser* p, unsigned int codepoint, float x, float y, float rotate)
+{
+	NSVGglyph* glyph = (NSVGglyph*)malloc(sizeof(NSVGglyph));
+	if (glyph == NULL) return;
+	glyph->codepoint = codepoint;
+	glyph->x = x;
+	glyph->y = y;
+	glyph->rotate = rotate;
+	glyph->next = NULL;
+	if (p->glyphsTail != NULL)
+		p->glyphsTail->next = glyph;
+	else
+		p->image->glyphs = glyph;
+	p->glyphsTail = glyph;
+}
+
+// Evaluate cubic bezier point and derivative at t.
+static void nsvg__evalCubic(const float* c, float t, float* pt, float* tan)
+{
+	float u = 1.0f - t;
+	float w0 = u*u*u, w1 = 3.0f*u*u*t, w2 = 3.0f*u*t*t, w3 = t*t*t;
+	pt[0] = w0*c[0] + w1*c[2] + w2*c[4] + w3*c[6];
+	pt[1] = w0*c[1] + w1*c[3] + w2*c[5] + w3*c[7];
+	tan[0] = 3.0f*u*u*(c[2]-c[0]) + 6.0f*u*t*(c[4]-c[2]) + 3.0f*t*t*(c[6]-c[4]);
+	tan[1] = 3.0f*u*u*(c[3]-c[1]) + 6.0f*u*t*(c[5]-c[3]) + 3.0f*t*t*(c[7]-c[5]);
+}
+
+// Find point and tangent angle (degrees) at arc length 'dist' along the paths. Clamps to path ends.
+static int nsvg__pointAlongPaths(NSVGpath* paths, float dist, float* px, float* py, float* angle)
+{
+	NSVGpath* path;
+	float d = 0.0f, prev[2] = {0.0f, 0.0f}, lastTan[2] = {1.0f, 0.0f};
+	int started = 0, i, k;
+	if (dist < 0.0f) dist = 0.0f;
+	for (path = paths; path != NULL; path = path->next) {
+		for (i = 0; i < path->npts-1; i += 3) {
+			const float* c = &path->pts[i*2];
+			for (k = 0; k <= 16; k++) {
+				float pt[2], tan[2];
+				nsvg__evalCubic(c, k/16.0f, pt, tan);
+				if (tan[0]*tan[0] + tan[1]*tan[1] > 1e-12f) {
+					lastTan[0] = tan[0];
+					lastTan[1] = tan[1];
+				}
+				if (started) {
+					float dx = pt[0]-prev[0], dy = pt[1]-prev[1];
+					float seg = sqrtf(dx*dx + dy*dy);
+					if (d + seg >= dist) {
+						float t = seg > 0.0f ? (dist - d) / seg : 0.0f;
+						*px = prev[0] + dx*t;
+						*py = prev[1] + dy*t;
+						*angle = atan2f(lastTan[1], lastTan[0]) * (180.0f / NSVG_PI);
+						return 1;
+					}
+					d += seg;
+				}
+				prev[0] = pt[0];
+				prev[1] = pt[1];
+				started = 1;
+			}
+		}
+	}
+	if (!started) return 0;
+	*px = prev[0];
+	*py = prev[1];
+	*angle = atan2f(lastTan[1], lastTan[0]) * (180.0f / NSVG_PI);
+	return 1;
+}
+
+static NSVGshape* nsvg__findShapeById(NSVGparser* p, const char* id)
+{
+	NSVGshape* shape;
+	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
+		if (strcmp(shape->id, id) == 0)
+			return shape;
+	}
+	return NULL;
+}
+
+// Lay out the accumulated <text> content into glyphs. Glyph local position and rotation are
+// computed first (along the baseline or referenced textPath), then the element transform is
+// applied on top: world = xform * local, rotation += rotation of xform.
+static void nsvg__layoutText(NSVGparser* p)
+{
+	NSVGattrib* attr = nsvg__getAttr(p);
+	NSVGshape* pathShape = NULL;
+	float fontSize = attr->fontSize > 0.0f ? attr->fontSize : 16.0f;
+	signed char orient = attr->writingMode ? attr->glyphOrientV : attr->glyphOrientH;
+	const char* s = p->textContent;
+	float xformAngle;
+	float vx, vy;
+	int index = 0;
+
+	if (p->textPathId[0] != '\0') {
+		pathShape = nsvg__findShapeById(p, p->textPathId);
+	}
+
+	nsvg__xformVec(&vx, &vy, 1.0f, 0.0f, attr->xform);
+	xformAngle = atan2f(vy, vx) * (180.0f / NSVG_PI);
+
+	while (*s) {
+		unsigned int cp;
+		float lx, ly, rot, gx, gy;
+		int n = 0;
+		cp = nsvg__utf8Decode(s, &n);
+		s += n;
+		if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r')
+			continue;
+
+		if (pathShape != NULL) {
+			float tangent = 0.0f;
+			if (!nsvg__pointAlongPaths(pathShape->paths, index * fontSize, &lx, &ly, &tangent))
+				break;
+			rot = (orient == NSVG_GLYPH_ORIENT_AUTO) ? tangent : tangent + (float)orient;
+		} else if (attr->writingMode) {
+			lx = p->textX;
+			ly = p->textY + index * fontSize;
+			rot = (orient == NSVG_GLYPH_ORIENT_AUTO) ? 90.0f : (float)orient;
+		} else {
+			lx = p->textX + index * fontSize;
+			ly = p->textY;
+			rot = (orient == NSVG_GLYPH_ORIENT_AUTO) ? 0.0f : (float)orient;
+		}
+
+		nsvg__xformPoint(&gx, &gy, lx, ly, attr->xform);
+		nsvg__addGlyph(p, cp, gx, gy, rot + xformAngle);
+		index++;
+	}
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
@@ -2896,6 +3079,32 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseSVG(p, attr);
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 1;
+	} else if (strcmp(el, "text") == 0) {
+		int i;
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
+		p->textX = 0.0f;
+		p->textY = 0.0f;
+		p->textPathId[0] = '\0';
+		p->textContentLen = 0;
+		p->textContent[0] = '\0';
+		for (i = 0; attr[i]; i += 2) {
+			if (strcmp(attr[i], "x") == 0)
+				p->textX = nsvg__parseCoordinate(p, attr[i + 1], nsvg__actualOrigX(p), nsvg__actualWidth(p));
+			else if (strcmp(attr[i], "y") == 0)
+				p->textY = nsvg__parseCoordinate(p, attr[i + 1], nsvg__actualOrigY(p), nsvg__actualHeight(p));
+		}
+		p->textFlag = 1;
+	} else if (strcmp(el, "textPath") == 0) {
+		if (p->textFlag) {
+			int i;
+			for (i = 0; attr[i]; i += 2) {
+				if ((strcmp(attr[i], "xlink:href") == 0 || strcmp(attr[i], "href") == 0) && attr[i + 1][0] == '#') {
+					strncpy(p->textPathId, attr[i + 1] + 1, 63);
+					p->textPathId[63] = '\0';
+				}
+			}
+		}
 	}
 }
 
@@ -2911,6 +3120,12 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
+	} else if (strcmp(el, "text") == 0) {
+		if (p->textFlag) {
+			nsvg__layoutText(p);
+			nsvg__popAttr(p);
+			p->textFlag = 0;
+		}
 	}
 }
 
@@ -2928,6 +3143,15 @@ static char *nsvg__strndup(const char *s, size_t n)
 static void nsvg__content(void* ud, const char* s)
 {
 	NSVGparser* p = (NSVGparser*)ud;
+	if (p->textFlag) {
+		// Accumulate text content; glyphs are laid out when the text element ends.
+		size_t n = strlen(s);
+		if (p->textContentLen + (int)n < (int)sizeof(p->textContent) - 8) {
+			memcpy(p->textContent + p->textContentLen, s, n + 1);
+			p->textContentLen += (int)n;
+		}
+		return;
+	}
 	if (!p->styleFlag)
 		return;
 
@@ -3053,6 +3277,7 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 {
 	NSVGshape* shape;
 	NSVGpath* path;
+	NSVGglyph* glyph;
 	float tx, ty, sx, sy, us, bounds[4], t[6], avgs;
 	int i;
 	float* pt;
@@ -3137,6 +3362,10 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		shape->strokeDashOffset *= avgs;
 		for (i = 0; i < shape->strokeDashCount; i++)
 			shape->strokeDashArray[i] *= avgs;
+	}
+	for (glyph = p->image->glyphs; glyph != NULL; glyph = glyph->next) {
+		glyph->x = (glyph->x + tx) * sx;
+		glyph->y = (glyph->y + ty) * sy;
 	}
 }
 
@@ -3260,6 +3489,7 @@ error:
 void nsvgDelete(NSVGimage* image)
 {
 	NSVGshape *snext, *shape;
+	NSVGglyph *gnext, *glyph;
 	if (image == NULL) return;
 	shape = image->shapes;
 	while (shape != NULL) {
@@ -3269,6 +3499,12 @@ void nsvgDelete(NSVGimage* image)
 		nsvg__deletePaint(&shape->stroke);
 		free(shape);
 		shape = snext;
+	}
+	glyph = image->glyphs;
+	while (glyph != NULL) {
+		gnext = glyph->next;
+		free(glyph);
+		glyph = gnext;
 	}
 	free(image);
 }
