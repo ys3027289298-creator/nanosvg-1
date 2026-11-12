@@ -112,6 +112,15 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+enum NSVGblendMode {
+	NSVG_BLEND_NORMAL = 0,
+	NSVG_BLEND_MULTIPLY,
+	NSVG_BLEND_SCREEN,
+	NSVG_BLEND_OVERLAY,
+	NSVG_BLEND_DARKEN,
+	NSVG_BLEND_LIGHTEN
+};
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -157,6 +166,8 @@ typedef struct NSVGshape
 	float miterLimit;			// Miter limit
 	char fillRule;				// Fill rule, see NSVGfillRule.
     unsigned char paintOrder;	// Encoded paint order (3×2-bit fields) see NSVGpaintOrder
+	unsigned char blendMode;	// See NSVGblendMode, parsed from 'mix-blend-mode'.
+	int isoId;					// Id of nearest ancestor group with isolation:isolate (0 = root).
 	unsigned char flags;		// Logical or of NSVG_FLAGS_* flags
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
@@ -445,6 +456,9 @@ typedef struct NSVGattrib
 	char hasFill;
 	char hasStroke;
 	char visible;
+	unsigned char blendMode;
+	char isolate;
+	int isoId;
     unsigned char paintOrder;
 } NSVGattrib;
 
@@ -467,6 +481,7 @@ typedef struct NSVGparser
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
 	NSVGshape* shapesTail;
+	int nextIsoId;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
 	float dpi;
@@ -663,6 +678,7 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].fillRule = NSVG_FILLRULE_NONZERO;
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
+	p->attr[0].blendMode = NSVG_BLEND_NORMAL;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
 
 	return p;
@@ -1005,6 +1021,8 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->miterLimit = attr->miterLimit;
 	shape->fillRule = attr->fillRule;
 	shape->opacity = attr->opacity;
+	shape->blendMode = attr->blendMode;
+	shape->isoId = attr->isoId;
     shape->paintOrder = attr->paintOrder;
 
 	shape->paths = p->plist;
@@ -1784,6 +1802,16 @@ static unsigned char nsvg__parsePaintOrder(const char* str)
 	return nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
 }
 
+static unsigned char nsvg__parseBlendMode(const char* str)
+{
+	if (strcmp(str, "multiply") == 0) return NSVG_BLEND_MULTIPLY;
+	if (strcmp(str, "screen") == 0) return NSVG_BLEND_SCREEN;
+	if (strcmp(str, "overlay") == 0) return NSVG_BLEND_OVERLAY;
+	if (strcmp(str, "darken") == 0) return NSVG_BLEND_DARKEN;
+	if (strcmp(str, "lighten") == 0) return NSVG_BLEND_LIGHTEN;
+	return NSVG_BLEND_NORMAL;
+}
+
 static const char* nsvg__getNextDashItem(const char* s, char* it)
 {
 	int n = 0;
@@ -1922,6 +1950,10 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
 		attr->paintOrder = nsvg__parsePaintOrder(value);
+	} else if (strcmp(name, "mix-blend-mode") == 0) {
+		attr->blendMode = nsvg__parseBlendMode(value);
+	} else if (strcmp(name, "isolation") == 0) {
+		attr->isolate = (strcmp(value, "isolate") == 0) ? 1 : 0;
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -2853,7 +2885,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 
 	if (strcmp(el, "g") == 0) {
 		nsvg__pushAttr(p);
+		nsvg__getAttr(p)->isolate = 0;
 		nsvg__parseAttribs(p, attr);
+		if (nsvg__getAttr(p)->isolate)
+			nsvg__getAttr(p)->isoId = ++p->nextIsoId;
 	} else if (strcmp(el, "path") == 0) {
 		if (p->pathFlag)	// Do not allow nested paths.
 			return;

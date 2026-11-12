@@ -1,0 +1,15 @@
+== Stage 1/5: build existing example2 and blend harness ==
+== Stage 2/5: run repository example (regression smoke test) ==
+example2 ok
+== Stage 3/5: multiply and overlay blend cases ==
+example/blend_multiply.svg sample(6,6) got rgb(128,32,32) formula rgb(128,32,32) PASS
+example/blend_overlay.svg sample(6,6) got rgb(40,137,201) formula rgb(40,137,201) PASS
+output/be_screen.svg sample(6,6) got rgb(88,176,232) formula rgb(88,176,232) PASS
+output/be_darken.svg sample(6,6) got rgb(32,96,160) formula rgb(32,96,160) PASS
+output/be_lighten.svg sample(6,6) got rgb(64,128,192) formula rgb(64,128,192) PASS
+== Stage 4/5: isolation before/after and normal-alpha regression ==
+example/blend_isolate_off.svg sample(6,6) got rgb(79,19,19) formula rgb(79,19,19) PASS
+example/blend_isolate_on.svg sample(6,6) got rgb(126,31,31) formula rgb(126,31,31) PASS
+example/blend_regression.svg sample(6,6) got rgb(191,95,95) formula rgb(191,95,95) PASS
+== Stage 5/5: summary ==
+RESULT: all cases PASS (artifacts in output/)

@@ -116,9 +116,12 @@ typedef struct NSVGmemPage {
 typedef struct NSVGcachedPaint {
 	signed char type;
 	char spread;
+	unsigned char blendMode;
 	float xform[6];
 	unsigned int colors[256];
 } NSVGcachedPaint;
+
+#define NSVG__MAX_LAYERS 16
 
 struct NSVGrasterizer
 {
@@ -148,6 +151,10 @@ struct NSVGrasterizer
 
 	unsigned char* bitmap;
 	int width, height, stride;
+
+	unsigned char* layerBuf[NSVG__MAX_LAYERS];
+	int layerId[NSVG__MAX_LAYERS];
+	int layerTop;
 };
 
 NSVGrasterizer* nsvgCreateRasterizer(void)
@@ -169,6 +176,7 @@ error:
 void nsvgDeleteRasterizer(NSVGrasterizer* r)
 {
 	NSVGmemPage* p;
+	int i;
 
 	if (r == NULL) return;
 
@@ -183,6 +191,8 @@ void nsvgDeleteRasterizer(NSVGrasterizer* r)
 	if (r->points) free(r->points);
 	if (r->points2) free(r->points2);
 	if (r->scanline) free(r->scanline);
+	for (i = 1; i < NSVG__MAX_LAYERS; i++)
+		if (r->layerBuf[i]) free(r->layerBuf[i]);
 
 	free(r);
 }
@@ -993,6 +1003,54 @@ static inline int nsvg__div255(int x)
     return ((x+1) * 257) >> 16;
 }
 
+// W3C Compositing & Blending Level 1 separable blend modes (channel values 0..255).
+static int nsvg__blendChannel(int cb, int cs, unsigned char mode)
+{
+	switch (mode) {
+	case NSVG_BLEND_MULTIPLY:
+		return nsvg__div255(cb * cs);
+	case NSVG_BLEND_SCREEN:
+		return cb + cs - nsvg__div255(cb * cs);
+	case NSVG_BLEND_OVERLAY:
+		if (cb < 128) return nsvg__div255(2 * cb * cs);
+		return 255 - nsvg__div255(2 * (255 - cb) * (255 - cs));
+	case NSVG_BLEND_DARKEN:
+		return cb < cs ? cb : cs;
+	case NSVG_BLEND_LIGHTEN:
+		return cb > cs ? cb : cs;
+	default:
+		return cs;
+	}
+}
+
+// Composite one source pixel (straight color + premultiplied alpha a) onto a
+// premultiplied destination, applying the shape's blend mode within the layer.
+static void nsvg__compositePixel(unsigned char* dst, int cr, int cg, int cb, int a,
+								 unsigned char mode)
+{
+	int ia = 255 - a;
+	int r, g, b;
+	if (mode == NSVG_BLEND_NORMAL) {
+		r = nsvg__div255(cr * a) + nsvg__div255(ia * (int)dst[0]);
+		g = nsvg__div255(cg * a) + nsvg__div255(ia * (int)dst[1]);
+		b = nsvg__div255(cb * a) + nsvg__div255(ia * (int)dst[2]);
+	} else {
+		int dr = dst[3] ? (int)dst[0] * 255 / (int)dst[3] : 0;
+		int dg = dst[3] ? (int)dst[1] * 255 / (int)dst[3] : 0;
+		int db = dst[3] ? (int)dst[2] * 255 / (int)dst[3] : 0;
+		dr = nsvg__blendChannel(dr, cr, mode);
+		dg = nsvg__blendChannel(dg, cg, mode);
+		db = nsvg__blendChannel(db, cb, mode);
+		r = nsvg__div255(dr * a) + nsvg__div255(ia * (int)dst[0]);
+		g = nsvg__div255(dg * a) + nsvg__div255(ia * (int)dst[1]);
+		b = nsvg__div255(db * a) + nsvg__div255(ia * (int)dst[2]);
+	}
+	dst[0] = (unsigned char)r;
+	dst[1] = (unsigned char)g;
+	dst[2] = (unsigned char)b;
+	dst[3] = (unsigned char)(a + nsvg__div255(ia * (int)dst[3]));
+}
+
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
@@ -1005,25 +1063,8 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		ca = (cache->colors[0] >> 24) & 0xff;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b;
-			int a = nsvg__div255((int)cover[0] * ca);
-			int ia = 255 - a;
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
-
+			nsvg__compositePixel(dst, cr, cg, cb,
+								 nsvg__div255((int)cover[0] * ca), cache->blendMode);
 			cover++;
 			dst += 4;
 		}
@@ -1032,7 +1073,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		// TODO: plenty of opportunities to optimize.
 		float fx, fy, dx, gy;
 		float* t = cache->xform;
-		int i, cr, cg, cb, ca;
+		int i, cr, cg, cb, ca, a;
 		unsigned int c;
 
 		fx = ((float)x - tx) / scale;
@@ -1040,7 +1081,6 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		dx = 1.0f / scale;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
 			gy = fx*t[1] + fy*t[3] + t[5];
 			c = cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)];
 			cr = (c) & 0xff;
@@ -1049,24 +1089,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			ca = (c >> 24) & 0xff;
 
 			a = nsvg__div255((int)cover[0] * ca);
-			ia = 255 - a;
-
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
-
+			nsvg__compositePixel(dst, cr, cg, cb, a, cache->blendMode);
 			cover++;
 			dst += 4;
 			fx += dx;
@@ -1077,7 +1100,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		// TODO: focus (fx,fy)
 		float fx, fy, dx, gx, gy, gd;
 		float* t = cache->xform;
-		int i, cr, cg, cb, ca;
+		int i, cr, cg, cb, ca, a;
 		unsigned int c;
 
 		fx = ((float)x - tx) / scale;
@@ -1085,7 +1108,6 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		dx = 1.0f / scale;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
 			gx = fx*t[0] + fy*t[2] + t[4];
 			gy = fx*t[1] + fy*t[3] + t[5];
 			gd = sqrtf(gx*gx + gy*gy);
@@ -1096,24 +1118,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			ca = (c >> 24) & 0xff;
 
 			a = nsvg__div255((int)cover[0] * ca);
-			ia = 255 - a;
-
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
-
+			nsvg__compositePixel(dst, cr, cg, cb, a, cache->blendMode);
 			cover++;
 			dst += 4;
 			fx += dx;
@@ -1387,6 +1392,9 @@ void nsvgRasterize(NSVGrasterizer* r,
 	r->width = w;
 	r->height = h;
 	r->stride = stride;
+	r->layerTop = 0;
+	r->layerId[0] = 0;
+	r->layerBuf[0] = dst;
 
 	if (w > r->cscanline) {
 		r->cscanline = w;
@@ -1400,6 +1408,22 @@ void nsvgRasterize(NSVGrasterizer* r,
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
+
+		// Reconcile the isolation layer stack with the shape's isolating group.
+		while (r->layerTop > 0 && r->layerId[r->layerTop] != shape->isoId)
+			r->layerTop--;
+		if (shape->isoId != 0 && r->layerId[r->layerTop] != shape->isoId) {
+			if (r->layerTop < NSVG__MAX_LAYERS - 1) {
+				int nbytes = h * stride;
+				r->layerTop++;
+				r->layerId[r->layerTop] = shape->isoId;
+				if (r->layerBuf[r->layerTop] == NULL)
+					r->layerBuf[r->layerTop] = (unsigned char*)malloc(nbytes);
+				if (r->layerBuf[r->layerTop])
+					memset(r->layerBuf[r->layerTop], 0, nbytes);
+			}
+		}
+		r->bitmap = r->layerBuf[r->layerTop] ? r->layerBuf[r->layerTop] : dst;
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1425,6 +1449,7 @@ void nsvgRasterize(NSVGrasterizer* r,
                     qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
 
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
+                cache.blendMode = shape->blendMode;
                 nsvg__initPaint(&cache, &shape->fill, shape->opacity);
 
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, shape->fillRule);
@@ -1452,11 +1477,30 @@ void nsvgRasterize(NSVGrasterizer* r,
                     qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
 
                 // now, traverse the scanlines and find the intersections on each scanline, use non-zero rule
+                cache.blendMode = shape->blendMode;
                 nsvg__initPaint(&cache, &shape->stroke, shape->opacity);
 
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
         }
+	}
+
+	// Flush isolated layers back into their parent layers with source-over.
+	while (r->layerTop > 0) {
+		unsigned char* src = r->layerBuf[r->layerTop];
+		unsigned char* parent = r->layerBuf[r->layerTop - 1] ? r->layerBuf[r->layerTop - 1] : dst;
+		if (src) {
+			for (i = 0; i < w * h; i++) {
+				int a = src[3], ia = 255 - a;
+				parent[0] = (unsigned char)(src[0] + nsvg__div255(ia * (int)parent[0]));
+				parent[1] = (unsigned char)(src[1] + nsvg__div255(ia * (int)parent[1]));
+				parent[2] = (unsigned char)(src[2] + nsvg__div255(ia * (int)parent[2]));
+				parent[3] = (unsigned char)(a + nsvg__div255(ia * (int)parent[3]));
+				src += 4;
+				parent += 4;
+			}
+		}
+		r->layerTop--;
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);
