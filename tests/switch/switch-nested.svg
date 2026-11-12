@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
+  <switch>
+    <g systemLanguage="en">
+      <rect x="5" y="5" width="20" height="20" fill="#0000ee"/>
+    </g>
+    <g systemLanguage="zh">
+      <switch>
+        <rect systemLanguage="zh-Hans" x="30" y="30" width="25" height="25" fill="#ee0000"/>
+        <rect x="60" y="60" width="15" height="15" fill="#00aa00"/>
+      </switch>
+    </g>
+  </switch>
+</svg>

@@ -376,6 +376,8 @@ enum NSVGgradientUnits {
 #define NSVG_MAX_DASHES 8
 #define NSVG_MAX_CLASSES 32
 
+#define NSVG_MAX_SWITCH_DEPTH 32
+
 enum NSVGunits {
 	NSVG_UNITS_USER,
 	NSVG_UNITS_PX,
@@ -473,6 +475,12 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	int elemDepth;
+	int skipFromDepth;
+	int switchDepth;
+	int switchChosen[NSVG_MAX_SWITCH_DEPTH];
+	int switchChildDepth[NSVG_MAX_SWITCH_DEPTH];
+	char systemLanguage[64];
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -664,6 +672,26 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
+
+	// User language for <switch> systemLanguage matching: NSVG_SYSTEM_LANGUAGE
+	// takes precedence, then LANG. Normalized to lowercase with '-' separators.
+	{
+		const char* lang = getenv("NSVG_SYSTEM_LANGUAGE");
+		int i = 0;
+		if (lang == NULL || lang[0] == '\0')
+			lang = getenv("LANG");
+		if (lang == NULL)
+			lang = "";
+		while (lang[i] && lang[i] != '.' && lang[i] != '@' && lang[i] != ':' &&
+			i < (int)sizeof(p->systemLanguage) - 1) {
+			char c = lang[i];
+			if (c == '_') c = '-';
+			if (c >= 'A' && c <= 'Z') c += 32;
+			p->systemLanguage[i] = c;
+			i++;
+		}
+		p->systemLanguage[i] = '\0';
+	}
 
 	return p;
 
@@ -2833,9 +2861,84 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+// Case-insensitive language tag match: tags match if either one is a
+// prefix of the other at a '-' boundary (e.g. "zh" matches "zh-CN").
+static int nsvg__langTagMatch(const char* a, const char* b)
+{
+	int i = 0;
+	while (a[i] && b[i]) {
+		char ca = a[i], cb = b[i];
+		if (ca >= 'A' && ca <= 'Z') ca += 32;
+		if (cb >= 'A' && cb <= 'Z') cb += 32;
+		if (ca != cb) return 0;
+		i++;
+	}
+	if (a[i] == '\0' && (b[i] == '\0' || b[i] == '-')) return 1;
+	if (b[i] == '\0' && (a[i] == '\0' || a[i] == '-')) return 1;
+	return 0;
+}
+
+// Matches the comma separated systemLanguage list against the user language.
+static int nsvg__matchSystemLanguage(NSVGparser* p, const char* value)
+{
+	const char* s = value;
+	while (*s) {
+		char tag[64];
+		int n = 0;
+		while (*s == ' ' || *s == '\t' || *s == ',') s++;
+		while (*s && *s != ',' && n < (int)sizeof(tag) - 1)
+			tag[n++] = *s++;
+		while (n > 0 && (tag[n-1] == ' ' || tag[n-1] == '\t')) n--;
+		tag[n] = '\0';
+		while (*s && *s != ',') s++;
+		if (n > 0 && nsvg__langTagMatch(p->systemLanguage, tag))
+			return 1;
+	}
+	return 0;
+}
+
+// Evaluates the conditional processing attributes of a <switch> child.
+// nanosvg advertises no SVG 1.1 feature strings and no extensions, so a
+// non-empty requiredFeatures/requiredExtensions never matches.
+static int nsvg__switchCondOk(NSVGparser* p, const char** attr)
+{
+	int i;
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "systemLanguage") == 0) {
+			if (attr[i + 1][0] != '\0' && !nsvg__matchSystemLanguage(p, attr[i + 1]))
+				return 0;
+		} else if (strcmp(attr[i], "requiredFeatures") == 0) {
+			if (attr[i + 1][0] != '\0')
+				return 0;
+		} else if (strcmp(attr[i], "requiredExtensions") == 0) {
+			if (attr[i + 1][0] != '\0')
+				return 0;
+		}
+	}
+	return 1;
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
+
+	p->elemDepth++;
+
+	// Inside a discarded <switch> branch: skip the whole subtree.
+	if (p->skipFromDepth > 0)
+		return;
+
+	// Direct child of the innermost <switch>: pick the first child whose
+	// conditional attributes pass, discard the rest.
+	if (p->switchDepth > 0 && p->switchDepth <= NSVG_MAX_SWITCH_DEPTH &&
+		p->elemDepth == p->switchChildDepth[p->switchDepth - 1]) {
+		int lvl = p->switchDepth - 1;
+		if (p->switchChosen[lvl] || !nsvg__switchCondOk(p, attr)) {
+			p->skipFromDepth = p->elemDepth;
+			return;
+		}
+		p->switchChosen[lvl] = 1;
+	}
 
 	if (p->defsFlag) {
 		// Skip everything but gradients and styles in defs
@@ -2892,6 +2995,14 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradientStop(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
+	} else if (strcmp(el, "switch") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
+		if (p->switchDepth < NSVG_MAX_SWITCH_DEPTH) {
+			p->switchChosen[p->switchDepth] = 0;
+			p->switchChildDepth[p->switchDepth] = p->elemDepth + 1;
+		}
+		p->switchDepth++;
 	} else if (strcmp(el, "svg") == 0) {
 		nsvg__parseSVG(p, attr);
 	} else if (strcmp(el, "style") == 0) {
@@ -2903,8 +3014,20 @@ static void nsvg__endElement(void* ud, const char* el)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
+	if (p->skipFromDepth > 0) {
+		if (p->elemDepth == p->skipFromDepth)
+			p->skipFromDepth = 0;
+		p->elemDepth--;
+		return;
+	}
+	p->elemDepth--;
+
 	if (strcmp(el, "g") == 0) {
 		nsvg__popAttr(p);
+	} else if (strcmp(el, "switch") == 0) {
+		nsvg__popAttr(p);
+		if (p->switchDepth > 0)
+			p->switchDepth--;
 	} else if (strcmp(el, "path") == 0) {
 		p->pathFlag = 0;
 	} else if (strcmp(el, "defs") == 0) {
