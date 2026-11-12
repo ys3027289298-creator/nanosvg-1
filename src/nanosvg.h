@@ -473,6 +473,14 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	char textFlag;		// Inside a <text> element, collecting its content.
+	char textBuf[256];	// Accumulated text content of the current <text>.
+	int textLen;
+	float textX, textY;
+	float textLengthValue;
+	int textLengthUnits;
+	char textXSet, textYSet, textLengthSet, textLengthAdjustSet;
+	char textSpacingAndGlyphs;
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -2351,7 +2359,7 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 	int i;
 	char item[64];
 
-	for (i = 0; attr[i]; i += 2) {
+	for (i = 0; attr != NULL && attr[i]; i += 2) {
 		if (strcmp(attr[i], "d") == 0) {
 			s = attr[i + 1];
 		} else {
@@ -2483,6 +2491,193 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 	}
 
 	nsvg__addShape(p);
+}
+
+// Minimal <text> support with textLength / lengthAdjust.
+//
+// NanoSVG has no font engine, so text is rendered with a built-in 5x7
+// bitmap font: each set pixel becomes a filled square subpath. The font
+// covers printable ASCII (32..126). This is enough to implement the SVG
+// text layout attributes textLength and lengthAdjust on real geometry.
+//
+// The 5x7 bitmap data is the "classic" Adafruit GFX font, distributed under
+// the BSD 2-Clause license (Copyright (c) 2012 Adafruit Industries), trimmed
+// here to printable ASCII. Each glyph is 5 column bytes, bit 0 = top row.
+#define NSVG_FONT_COLS 5
+#define NSVG_FONT_ROWS 7
+#define NSVG_FONT_FIRST 32
+#define NSVG_FONT_LAST 126
+static const unsigned char nsvg__font5x7[(NSVG_FONT_LAST-NSVG_FONT_FIRST+1)*NSVG_FONT_COLS] = {
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x00, 0x00, 0x00, 0x07, 0x00, 0x07, 0x00,
+	0x14, 0x7F, 0x14, 0x7F, 0x14, 0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x23, 0x13, 0x08, 0x64, 0x62,
+	0x36, 0x49, 0x56, 0x20, 0x50, 0x00, 0x08, 0x07, 0x03, 0x00, 0x00, 0x1C, 0x22, 0x41, 0x00,
+	0x00, 0x41, 0x22, 0x1C, 0x00, 0x2A, 0x1C, 0x7F, 0x1C, 0x2A, 0x08, 0x08, 0x3E, 0x08, 0x08,
+	0x00, 0x80, 0x70, 0x30, 0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00, 0x60, 0x60, 0x00,
+	0x20, 0x10, 0x08, 0x04, 0x02, 0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x42, 0x7F, 0x40, 0x00,
+	0x72, 0x49, 0x49, 0x49, 0x46, 0x21, 0x41, 0x49, 0x4D, 0x33, 0x18, 0x14, 0x12, 0x7F, 0x10,
+	0x27, 0x45, 0x45, 0x45, 0x39, 0x3C, 0x4A, 0x49, 0x49, 0x31, 0x41, 0x21, 0x11, 0x09, 0x07,
+	0x36, 0x49, 0x49, 0x49, 0x36, 0x46, 0x49, 0x49, 0x29, 0x1E, 0x00, 0x00, 0x14, 0x00, 0x00,
+	0x00, 0x40, 0x34, 0x00, 0x00, 0x00, 0x08, 0x14, 0x22, 0x41, 0x14, 0x14, 0x14, 0x14, 0x14,
+	0x00, 0x41, 0x22, 0x14, 0x08, 0x02, 0x01, 0x59, 0x09, 0x06, 0x3E, 0x41, 0x5D, 0x59, 0x4E,
+	0x7C, 0x12, 0x11, 0x12, 0x7C, 0x7F, 0x49, 0x49, 0x49, 0x36, 0x3E, 0x41, 0x41, 0x41, 0x22,
+	0x7F, 0x41, 0x41, 0x41, 0x3E, 0x7F, 0x49, 0x49, 0x49, 0x41, 0x7F, 0x09, 0x09, 0x09, 0x01,
+	0x3E, 0x41, 0x41, 0x51, 0x73, 0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00, 0x41, 0x7F, 0x41, 0x00,
+	0x20, 0x40, 0x41, 0x3F, 0x01, 0x7F, 0x08, 0x14, 0x22, 0x41, 0x7F, 0x40, 0x40, 0x40, 0x40,
+	0x7F, 0x02, 0x1C, 0x02, 0x7F, 0x7F, 0x04, 0x08, 0x10, 0x7F, 0x3E, 0x41, 0x41, 0x41, 0x3E,
+	0x7F, 0x09, 0x09, 0x09, 0x06, 0x3E, 0x41, 0x51, 0x21, 0x5E, 0x7F, 0x09, 0x19, 0x29, 0x46,
+	0x26, 0x49, 0x49, 0x49, 0x32, 0x03, 0x01, 0x7F, 0x01, 0x03, 0x3F, 0x40, 0x40, 0x40, 0x3F,
+	0x1F, 0x20, 0x40, 0x20, 0x1F, 0x3F, 0x40, 0x38, 0x40, 0x3F, 0x63, 0x14, 0x08, 0x14, 0x63,
+	0x03, 0x04, 0x78, 0x04, 0x03, 0x61, 0x59, 0x49, 0x4D, 0x43, 0x00, 0x7F, 0x41, 0x41, 0x41,
+	0x02, 0x04, 0x08, 0x10, 0x20, 0x00, 0x41, 0x41, 0x41, 0x7F, 0x04, 0x02, 0x01, 0x02, 0x04,
+	0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x03, 0x07, 0x08, 0x00, 0x20, 0x54, 0x54, 0x78, 0x40,
+	0x7F, 0x28, 0x44, 0x44, 0x38, 0x38, 0x44, 0x44, 0x44, 0x28, 0x38, 0x44, 0x44, 0x28, 0x7F,
+	0x38, 0x54, 0x54, 0x54, 0x18, 0x00, 0x08, 0x7E, 0x09, 0x02, 0x18, 0xA4, 0xA4, 0x9C, 0x78,
+	0x7F, 0x08, 0x04, 0x04, 0x78, 0x00, 0x44, 0x7D, 0x40, 0x00, 0x20, 0x40, 0x40, 0x3D, 0x00,
+	0x7F, 0x10, 0x28, 0x44, 0x00, 0x00, 0x41, 0x7F, 0x40, 0x00, 0x7C, 0x04, 0x78, 0x04, 0x78,
+	0x7C, 0x08, 0x04, 0x04, 0x78, 0x38, 0x44, 0x44, 0x44, 0x38, 0xFC, 0x18, 0x24, 0x24, 0x18,
+	0x18, 0x24, 0x24, 0x18, 0xFC, 0x7C, 0x08, 0x04, 0x04, 0x08, 0x48, 0x54, 0x54, 0x54, 0x24,
+	0x04, 0x04, 0x3F, 0x44, 0x24, 0x3C, 0x40, 0x40, 0x20, 0x7C, 0x1C, 0x20, 0x40, 0x20, 0x1C,
+	0x3C, 0x40, 0x30, 0x40, 0x3C, 0x44, 0x28, 0x10, 0x28, 0x44, 0x4C, 0x90, 0x90, 0x90, 0x7C,
+	0x44, 0x64, 0x54, 0x4C, 0x44, 0x00, 0x08, 0x36, 0x41, 0x00, 0x00, 0x00, 0x77, 0x00, 0x00,
+	0x00, 0x41, 0x36, 0x08, 0x00, 0x02, 0x01, 0x02, 0x04, 0x02,};
+
+static const unsigned char* nsvg__glyphRows(unsigned int c)
+{
+	if (c < NSVG_FONT_FIRST || c > NSVG_FONT_LAST)
+		c = '?';
+	return &nsvg__font5x7[(c - NSVG_FONT_FIRST) * NSVG_FONT_COLS];
+}
+
+// One filled pixel cell of a glyph as a closed unit-square subpath.
+static void nsvg__fontRect(NSVGparser* p, float x, float y, float s)
+{
+	nsvg__resetPath(p);
+	nsvg__moveTo(p, x, y);
+	nsvg__lineTo(p, x + s, y);
+	nsvg__lineTo(p, x + s, y + s);
+	nsvg__lineTo(p, x, y + s);
+	nsvg__addPath(p, 1);
+}
+
+static void nsvg__parseTextAttributes(NSVGparser* p, const char** attr)
+{
+	int i;
+	p->textXSet = p->textYSet = 0;
+	p->textLengthSet = p->textLengthAdjustSet = 0;
+	p->textSpacingAndGlyphs = 0;
+	p->textX = p->textY = 0.0f;
+	p->textLengthValue = 0.0f;
+	for (i = 0; attr[i]; i += 2) {
+		if (nsvg__parseAttr(p, attr[i], attr[i + 1]))
+			continue;
+		if (strcmp(attr[i], "x") == 0) {
+			p->textXSet = 1;
+			p->textX = nsvg__parseCoordinate(p, attr[i + 1], nsvg__actualOrigX(p), nsvg__actualWidth(p));
+		} else if (strcmp(attr[i], "y") == 0) {
+			p->textYSet = 1;
+			p->textY = nsvg__parseCoordinate(p, attr[i + 1], nsvg__actualOrigY(p), nsvg__actualHeight(p));
+		} else if (strcmp(attr[i], "textLength") == 0) {
+			NSVGcoordinate c = nsvg__parseCoordinateRaw(attr[i + 1]);
+			p->textLengthSet = 1;
+			p->textLengthValue = c.value;
+			p->textLengthUnits = c.units;
+		} else if (strcmp(attr[i], "lengthAdjust") == 0) {
+			p->textLengthAdjustSet = 1;
+			if (strcmp(attr[i + 1], "spacingAndGlyphs") == 0)
+				p->textSpacingAndGlyphs = 1;
+		}
+	}
+}
+
+static void nsvg__layoutText(NSVGparser* p)
+{
+	NSVGattrib* style = nsvg__getAttr(p);
+	float originX = p->textXSet ? p->textX : 0.0f;
+	float originY = p->textYSet ? p->textY : 0.0f;
+	float textLength = -1.0f;
+	int spacingAndGlyphs = 0;
+	int haveLengthAdjust = p->textLengthAdjustSet;
+	float fontSize, cellW, cellH, gap;
+	float naturalW, extra, slot, penX, scale;
+	int i, n, col, row;
+
+	if (p->textLengthSet) {
+		NSVGcoordinate c;
+		c.value = p->textLengthValue;
+		c.units = p->textLengthUnits;
+		textLength = nsvg__convertToPixels(p, c, 0.0f, nsvg__actualLength(p));
+	}
+	spacingAndGlyphs = p->textSpacingAndGlyphs;
+
+	// SVG fallback: lengthAdjust without textLength has no effect, and
+	// textLength alone defaults to lengthAdjust="spacing".
+	if (textLength <= 0.0f) {
+		textLength = -1.0f;
+		spacingAndGlyphs = 0;
+	} else if (!haveLengthAdjust) {
+		spacingAndGlyphs = 0;
+	}
+	(void)haveLengthAdjust;
+
+	// Trim the collected content; only horizontal single-line text is laid out.
+	n = p->textLen;
+	while (n > 0 && nsvg__isspace((unsigned char)p->textBuf[n - 1]))
+		n--;
+	{
+		int first = 0;
+		while (first < n && nsvg__isspace((unsigned char)p->textBuf[first]))
+			first++;
+		if (first > 0) {
+			memmove(p->textBuf, p->textBuf + first, (size_t)(n - first));
+			n -= first;
+		}
+	}
+	if (n == 0 || !style->visible)
+		return;
+
+	fontSize = style->fontSize > 0.0f ? style->fontSize : 16.0f;
+	cellH = fontSize;
+	cellW = fontSize * ((float)NSVG_FONT_COLS / (float)NSVG_FONT_ROWS);
+	gap = cellW * 0.2f;
+
+	// Natural width: n glyph cells plus (n-1) gaps.
+	naturalW = n * cellW + (n - 1) * gap;
+
+	nsvg__resetPath(p);
+	penX = originX;
+	if (textLength < 0.0f) {
+		slot = cellW + gap;
+	} else if (spacingAndGlyphs) {
+		// Scale glyphs and spacing uniformly so the ink spans textLength.
+		scale = textLength / naturalW;
+		cellW *= scale;
+		cellH *= scale;
+		slot = cellW + gap * scale;
+	} else {
+		// Keep glyph outlines intact, distribute the difference over gaps.
+		extra = textLength - naturalW;
+		slot = cellW + gap + (n > 1 ? extra / (n - 1) : 0.0f);
+	}
+
+	for (i = 0; i < n; i++) {
+		const unsigned char* rows = nsvg__glyphRows((unsigned char)p->textBuf[i]);
+		float gx = penX;
+		for (col = 0; col < NSVG_FONT_COLS; col++) {
+			unsigned char bits = rows[col];
+			for (row = 0; row < NSVG_FONT_ROWS; row++) {
+				if (bits & (1u << row)) {
+					float px = gx + cellW * col / NSVG_FONT_COLS;
+					// y is the baseline: bitmap top sits one em above it.
+					float py = originY - cellH + cellH * row / NSVG_FONT_ROWS;
+					nsvg__fontRect(p, px, py, cellW / NSVG_FONT_COLS);
+				}
+			}
+		}
+		penX += slot;
+	}
+
+	if (p->npts > 0)
+		nsvg__addShape(p);
 }
 
 static void nsvg__parseRect(NSVGparser* p, const char** attr)
@@ -2896,6 +3091,17 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseSVG(p, attr);
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 1;
+	} else if (strcmp(el, "text") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
+		nsvg__parseTextAttributes(p, attr);
+		p->textFlag = 1;
+		p->textLen = 0;
+		p->textBuf[0] = '\0';
+	} else if (strcmp(el, "tspan") == 0) {
+		// Only the outer <text> drives layout; let <tspan> inherit styling.
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
 	}
 }
 
@@ -2911,6 +3117,13 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
+	} else if (strcmp(el, "tspan") == 0) {
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "text") == 0) {
+		nsvg__layoutText(p);
+		p->textFlag = 0;
+		p->textLen = 0;
+		nsvg__popAttr(p);
 	}
 }
 
@@ -2928,6 +3141,12 @@ static char *nsvg__strndup(const char *s, size_t n)
 static void nsvg__content(void* ud, const char* s)
 {
 	NSVGparser* p = (NSVGparser*)ud;
+	if (p->textFlag) {
+		while (*s && p->textLen < (int)sizeof(p->textBuf) - 1)
+			p->textBuf[p->textLen++] = *s++;
+		p->textBuf[p->textLen] = '\0';
+		return;
+	}
 	if (!p->styleFlag)
 		return;
 

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="60" viewBox="0 0 260 60">
+  <rect x="0" y="0" width="260" height="60" fill="white"/>
+  <text x="10" y="38" font-size="16" fill="black"
+        textLength="240" lengthAdjust="spacing">NANOSVG</text>
+</svg>

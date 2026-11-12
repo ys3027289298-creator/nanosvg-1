@@ -1,0 +1,9 @@
+case                           target     actual  deviation   verdict
+01_expand_spacing                 240        240      +0.0px      PASS
+02_condense_spacing                60         60      +0.0px      PASS
+03_expand_glyphs                  240        240      +0.0px      PASS
+04_regression_plain           natural         94      +0.0px        ok
+05_fallback_adjust_only       natural         94      +0.0px        ok
+06_fallback_length_only           240        240      +0.0px      PASS
+natural baseline 04 == 05: True
+RESULT: PASS
