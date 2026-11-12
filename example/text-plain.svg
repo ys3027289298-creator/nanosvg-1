@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="60" viewBox="0 0 300 60">
+  <rect x="10" y="40" width="20" height="10"/>
+  <text x="10" y="30" font-size="16">plain <tspan>span</tspan> tail</text>
+</svg>

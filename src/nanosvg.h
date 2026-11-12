@@ -166,11 +166,30 @@ typedef struct NSVGshape
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
 } NSVGshape;
 
+// Baseline shift types, see NSVGtextSpan.
+enum NSVGbaselineShift {
+	NSVG_BASELINE_SHIFT_NONE = 0,
+	NSVG_BASELINE_SHIFT_SUB,
+	NSVG_BASELINE_SHIFT_SUPER,
+	NSVG_BASELINE_SHIFT_PERCENT,
+	NSVG_BASELINE_SHIFT_LENGTH
+};
+
+typedef struct NSVGtextSpan
+{
+	float x, y;					// Anchor point of the text span (user units).
+	float baselineShift;		// Baseline offset in user units, positive shifts the baseline up.
+	float fontSize;				// Font size in effect for the span (user units).
+	char* text;					// Text content of the span.
+	struct NSVGtextSpan* next;	// Pointer to next span, or NULL if last element.
+} NSVGtextSpan;
+
 typedef struct NSVGimage
 {
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGtextSpan* textSpans;	// Linked list of text spans in the image.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -375,6 +394,7 @@ enum NSVGgradientUnits {
 
 #define NSVG_MAX_DASHES 8
 #define NSVG_MAX_CLASSES 32
+#define NSVG_MAX_TEXT_NESTING 16
 
 enum NSVGunits {
 	NSVG_UNITS_USER,
@@ -439,6 +459,8 @@ typedef struct NSVGattrib
 	float miterLimit;
 	char fillRule;
 	float fontSize;
+	char baselineShiftType;
+	float baselineShiftValue;
 	unsigned int stopColor;
 	float stopOpacity;
 	float stopOffset;
@@ -467,6 +489,10 @@ typedef struct NSVGparser
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
 	NSVGshape* shapesTail;
+	NSVGtextSpan* textSpansTail;
+	NSVGtextSpan* textSpanStack[NSVG_MAX_TEXT_NESTING];
+	int textSpanDepth;
+	float textX, textY;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
 	float dpi;
@@ -1856,6 +1882,27 @@ static void nsvg__applyClassStyles(NSVGparser* p, const char* value)
 	}
 }
 
+static void nsvg__parseBaselineShift(NSVGparser* p, NSVGattrib* attr, const char* str)
+{
+	NSVGcoordinate coord;
+	if (strcmp(str, "sub") == 0) {
+		attr->baselineShiftType = NSVG_BASELINE_SHIFT_SUB;
+	} else if (strcmp(str, "super") == 0) {
+		attr->baselineShiftType = NSVG_BASELINE_SHIFT_SUPER;
+	} else if (strcmp(str, "baseline") == 0 || strcmp(str, "inherit") == 0) {
+		attr->baselineShiftType = NSVG_BASELINE_SHIFT_NONE;
+	} else {
+		coord = nsvg__parseCoordinateRaw(str);
+		if (coord.units == NSVG_UNITS_PERCENT) {
+			attr->baselineShiftType = NSVG_BASELINE_SHIFT_PERCENT;
+			attr->baselineShiftValue = coord.value;
+		} else {
+			attr->baselineShiftType = NSVG_BASELINE_SHIFT_LENGTH;
+			attr->baselineShiftValue = nsvg__convertToPixels(p, coord, 0.0f, 0.0f);
+		}
+	}
+}
+
 static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 {
 	float xform[6];
@@ -1911,6 +1958,8 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->fillRule = nsvg__parseFillRule(value);
 	} else if (strcmp(name, "font-size") == 0) {
 		attr->fontSize = nsvg__parseCoordinate(p, value, 0.0f, nsvg__actualLength(p));
+	} else if (strcmp(name, "baseline-shift") == 0) {
+		nsvg__parseBaselineShift(p, attr, value);
 	} else if (strcmp(name, "transform") == 0) {
 		nsvg__parseTransform(xform, value);
 		nsvg__xformPremultiply(attr->xform, xform);
@@ -2833,6 +2882,84 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+// Resolves the effective baseline shift of the current attribute set in user units.
+// Percentages and the sub/super keywords are relative to the font size,
+// lengths are used as specified. Positive values shift the baseline up.
+static float nsvg__resolveBaselineShift(NSVGparser* p)
+{
+	NSVGattrib* attr = nsvg__getAttr(p);
+	switch (attr->baselineShiftType) {
+		case NSVG_BASELINE_SHIFT_SUB: return -0.2f * attr->fontSize;
+		case NSVG_BASELINE_SHIFT_SUPER: return 0.33f * attr->fontSize;
+		case NSVG_BASELINE_SHIFT_PERCENT: return attr->baselineShiftValue / 100.0f * attr->fontSize;
+		case NSVG_BASELINE_SHIFT_LENGTH: return attr->baselineShiftValue;
+		default: return 0.0f;
+	}
+}
+
+static void nsvg__startTextSpan(NSVGparser* p, const char** attr)
+{
+	NSVGtextSpan* span;
+	float x = p->textX, y = p->textY;
+	int i;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "x") == 0) x = nsvg__parseCoordinate(p, attr[i+1], nsvg__actualOrigX(p), nsvg__actualWidth(p));
+		else if (strcmp(attr[i], "y") == 0) y = nsvg__parseCoordinate(p, attr[i+1], nsvg__actualOrigY(p), nsvg__actualHeight(p));
+	}
+	p->textX = x;
+	p->textY = y;
+
+	if (p->textSpanDepth >= NSVG_MAX_TEXT_NESTING)
+		return;
+
+	span = (NSVGtextSpan*)malloc(sizeof(NSVGtextSpan));
+	if (span == NULL) return;
+	memset(span, 0, sizeof(NSVGtextSpan));
+	span->x = x;
+	span->y = y;
+	span->fontSize = nsvg__getAttr(p)->fontSize;
+	span->baselineShift = nsvg__resolveBaselineShift(p);
+	p->textSpanStack[p->textSpanDepth++] = span;
+}
+
+static int nsvg__endTextSpan(NSVGparser* p)
+{
+	NSVGtextSpan* span;
+	if (p->textSpanDepth <= 0)
+		return 0;
+	span = p->textSpanStack[--p->textSpanDepth];
+	if (span->text == NULL) {
+		free(span);
+		return 1;
+	}
+	if (p->textSpansTail != NULL)
+		p->textSpansTail->next = span;
+	else
+		p->image->textSpans = span;
+	p->textSpansTail = span;
+	return 1;
+}
+
+static void nsvg__spanText(NSVGparser* p, const char* s)
+{
+	NSVGtextSpan* span;
+	const char* t = s;
+	size_t oldLen, addLen;
+	char* text;
+
+	while (*t && nsvg__isspace(*t)) t++;
+	if (*t == '\0') return;	// Skip whitespace only content.
+
+	span = p->textSpanStack[p->textSpanDepth-1];
+	oldLen = span->text != NULL ? strlen(span->text) : 0;
+	addLen = strlen(s);
+	text = (char*)realloc(span->text, oldLen + addLen + 1);
+	if (text == NULL) return;
+	memcpy(text + oldLen, s, addLen + 1);
+	span->text = text;
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
@@ -2896,6 +3023,12 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseSVG(p, attr);
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 1;
+	} else if (strcmp(el, "text") == 0 || strcmp(el, "tspan") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__getAttr(p)->baselineShiftType = NSVG_BASELINE_SHIFT_NONE;	// Not inherited.
+		nsvg__getAttr(p)->baselineShiftValue = 0.0f;
+		nsvg__parseAttribs(p, attr);
+		nsvg__startTextSpan(p, attr);
 	}
 }
 
@@ -2911,6 +3044,9 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
+	} else if (strcmp(el, "text") == 0 || strcmp(el, "tspan") == 0) {
+		if (nsvg__endTextSpan(p))
+			nsvg__popAttr(p);
 	}
 }
 
@@ -2928,8 +3064,11 @@ static char *nsvg__strndup(const char *s, size_t n)
 static void nsvg__content(void* ud, const char* s)
 {
 	NSVGparser* p = (NSVGparser*)ud;
-	if (!p->styleFlag)
+	if (!p->styleFlag) {
+		if (p->textSpanDepth > 0)
+			nsvg__spanText(p, s);
 		return;
+	}
 
 	// Parse all the styles inside the style block. Each style's content will be later processed using nsvg__parseStyle().
 	// Note: We only support selector lists of simple class selectors (e.g. ".foo, .bar { ... }").
@@ -3053,6 +3192,7 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 {
 	NSVGshape* shape;
 	NSVGpath* path;
+	NSVGtextSpan* span;
 	float tx, ty, sx, sy, us, bounds[4], t[6], avgs;
 	int i;
 	float* pt;
@@ -3137,6 +3277,13 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		shape->strokeDashOffset *= avgs;
 		for (i = 0; i < shape->strokeDashCount; i++)
 			shape->strokeDashArray[i] *= avgs;
+	}
+
+	for (span = p->image->textSpans; span != NULL; span = span->next) {
+		span->x = (span->x + tx) * sx;
+		span->y = (span->y + ty) * sy;
+		span->baselineShift *= avgs;
+		span->fontSize *= avgs;
 	}
 }
 
@@ -3260,6 +3407,7 @@ error:
 void nsvgDelete(NSVGimage* image)
 {
 	NSVGshape *snext, *shape;
+	NSVGtextSpan *tnext, *span;
 	if (image == NULL) return;
 	shape = image->shapes;
 	while (shape != NULL) {
@@ -3269,6 +3417,13 @@ void nsvgDelete(NSVGimage* image)
 		nsvg__deletePaint(&shape->stroke);
 		free(shape);
 		shape = snext;
+	}
+	span = image->textSpans;
+	while (span != NULL) {
+		tnext = span->next;
+		free(span->text);
+		free(span);
+		span = tnext;
 	}
 	free(image);
 }

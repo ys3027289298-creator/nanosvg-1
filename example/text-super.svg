@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="60" viewBox="0 0 300 60">
+  <text x="10" y="35" font-size="30">E=mc<tspan baseline-shift="super">2</tspan></text>
+  <text x="10" y="55" font-size="20">H<tspan style="baseline-shift:sub">2</tspan>O</text>
+</svg>

@@ -26,13 +26,48 @@
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvgrast.h"
 
-int main()
+static int dumpTextSpans(const char* filename)
+{
+	NSVGimage* image = NULL;
+	NSVGtextSpan* span;
+	int n = 0;
+
+	printf("parsing %s\n", filename);
+	image = nsvgParseFromFile(filename, "px", 96.0f);
+	if (image == NULL) {
+		printf("Could not open SVG image.\n");
+		return 1;
+	}
+	for (span = image->textSpans; span != NULL; span = span->next, n++) {
+		printf("span[%d] \"%s\" font-size=%.4g anchor=(%.3f, %.3f) shift=%.3f baseline=(%.3f, %.3f)\n",
+			n, span->text, span->fontSize,
+			span->x, span->y, span->baselineShift,
+			span->x, span->y - span->baselineShift);
+	}
+	if (n == 0)
+		printf("no text spans found.\n");
+	nsvgDelete(image);
+	return 0;
+}
+
+int main(int argc, char** argv)
 {
 	NSVGimage *image = NULL;
 	NSVGrasterizer *rast = NULL;
 	unsigned char* img = NULL;
 	int w, h;
 	const char* filename = "../example/23.svg";
+	const char* outname = "svg.png";
+
+	if (argc > 1 && strcmp(argv[1], "--text") == 0) {
+		if (argc < 3) {
+			printf("usage: example2 --text <file.svg>\n");
+			return 1;
+		}
+		return dumpTextSpans(argv[2]);
+	}
+	if (argc > 1) filename = argv[1];
+	if (argc > 2) outname = argv[2];
 
 	printf("parsing %s\n", filename);
 	image = nsvgParseFromFile(filename, "px", 96.0f);
@@ -58,8 +93,8 @@ int main()
 	printf("rasterizing image %d x %d\n", w, h);
 	nsvgRasterize(rast, image, 0,0,1, img, w, h, w*4);
 
-	printf("writing svg.png\n");
- 	stbi_write_png("svg.png", w, h, 4, img, w*4);
+	printf("writing %s\n", outname);
+ 	stbi_write_png(outname, w, h, 4, img, w*4);
 
 error:
 	nsvgDeleteRasterizer(rast);

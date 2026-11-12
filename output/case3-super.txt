@@ -1,0 +1,5 @@
+parsing example/text-super.svg
+span[0] "2" font-size=30 anchor=(10.000, 35.000) shift=9.900 baseline=(10.000, 25.100)
+span[1] "E=mc" font-size=30 anchor=(10.000, 35.000) shift=0.000 baseline=(10.000, 35.000)
+span[2] "2" font-size=20 anchor=(10.000, 55.000) shift=-4.000 baseline=(10.000, 59.000)
+span[3] "HO" font-size=20 anchor=(10.000, 55.000) shift=0.000 baseline=(10.000, 55.000)

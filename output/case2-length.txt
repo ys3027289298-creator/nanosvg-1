@@ -1,0 +1,4 @@
+parsing example/text-length.svg
+span[0] "up" font-size=20 anchor=(10.000, 40.000) shift=6.000 baseline=(10.000, 34.000)
+span[1] "dn" font-size=20 anchor=(10.000, 40.000) shift=-4.000 baseline=(10.000, 44.000)
+span[2] "AB" font-size=20 anchor=(10.000, 40.000) shift=0.000 baseline=(10.000, 40.000)
