@@ -1,0 +1,60 @@
+linear.svg
+  i= 0 x= 0 t=0.000 alpha=255 theory= 255.0 diff=+0.0
+  i= 1 x= 2 t=0.065 alpha=240 theory= 239.0 diff=+1.0
+  i= 2 x= 4 t=0.129 alpha=224 theory= 223.0 diff=+1.0
+  i= 3 x= 6 t=0.194 alpha=208 theory= 206.0 diff=+2.0
+  i= 4 x= 8 t=0.258 alpha=192 theory= 190.0 diff=+2.0
+  i= 5 x=10 t=0.323 alpha=176 theory= 173.0 diff=+3.0
+  i= 6 x=12 t=0.387 alpha=160 theory= 157.0 diff=+3.0
+  i= 7 x=14 t=0.452 alpha=144 theory= 140.0 diff=+4.0
+  i= 8 x=17 t=0.548 alpha=120 theory= 116.0 diff=+4.0
+  i= 9 x=19 t=0.613 alpha=104 theory=  99.0 diff=+5.0
+  i=10 x=21 t=0.677 alpha= 88 theory=  83.0 diff=+5.0
+  i=11 x=23 t=0.742 alpha= 72 theory=  66.0 diff=+6.0
+  i=12 x=25 t=0.806 alpha= 56 theory=  50.0 diff=+6.0
+  i=13 x=27 t=0.871 alpha= 40 theory=  33.0 diff=+7.0
+  i=14 x=29 t=0.935 alpha= 24 theory=  17.0 diff=+7.0
+  i=15 x=31 t=1.000 alpha=  8 theory=   0.0 diff=+8.0
+radial.svg
+  i= 0 x= 8 t=0.000 alpha=255 theory= 255.0 diff=+0.0
+  i= 1 x= 9 t=0.125 alpha=224 theory= 224.0 diff=+0.0
+  i= 2 x=10 t=0.250 alpha=192 theory= 192.0 diff=+0.0
+  i= 3 x=11 t=0.375 alpha=160 theory= 160.0 diff=+0.0
+  i= 4 x=12 t=0.500 alpha=128 theory= 128.0 diff=+0.0
+  i= 5 x=13 t=0.625 alpha= 96 theory=  96.0 diff=+0.0
+  i= 6 x=14 t=0.750 alpha= 64 theory=  64.0 diff=+0.0
+  i= 7 x=15 t=0.875 alpha= 32 theory=  32.0 diff=+0.0
+single.svg
+  i= 0 x= 0 t=0.000 alpha=255 theory= 255.0 diff=+0.0
+  i= 1 x= 1 t=0.067 alpha=255 theory= 255.0 diff=+0.0
+  i= 2 x= 2 t=0.133 alpha=255 theory= 255.0 diff=+0.0
+  i= 3 x= 3 t=0.200 alpha=255 theory= 255.0 diff=+0.0
+  i= 4 x= 4 t=0.267 alpha=255 theory= 255.0 diff=+0.0
+  i= 5 x= 5 t=0.333 alpha=255 theory= 255.0 diff=+0.0
+  i= 6 x= 6 t=0.400 alpha=255 theory= 255.0 diff=+0.0
+  i= 7 x= 7 t=0.467 alpha=255 theory= 255.0 diff=+0.0
+  i= 8 x= 8 t=0.533 alpha=255 theory= 255.0 diff=+0.0
+  i= 9 x= 9 t=0.600 alpha=255 theory= 255.0 diff=+0.0
+  i=10 x=10 t=0.667 alpha=255 theory= 255.0 diff=+0.0
+  i=11 x=11 t=0.733 alpha=255 theory= 255.0 diff=+0.0
+  i=12 x=12 t=0.800 alpha=255 theory= 255.0 diff=+0.0
+  i=13 x=13 t=0.867 alpha=255 theory= 255.0 diff=+0.0
+  i=14 x=14 t=0.933 alpha=255 theory= 255.0 diff=+0.0
+  i=15 x=15 t=1.000 alpha=255 theory= 255.0 diff=+0.0
+regression.svg
+  i= 0 x= 0 t=0.000 alpha=255 theory= 255.0 diff=+0.0
+  i= 1 x= 2 t=0.065 alpha=240 theory= 239.0 diff=+1.0
+  i= 2 x= 4 t=0.129 alpha=224 theory= 223.0 diff=+1.0
+  i= 3 x= 6 t=0.194 alpha=208 theory= 206.0 diff=+2.0
+  i= 4 x= 8 t=0.258 alpha=192 theory= 190.0 diff=+2.0
+  i= 5 x=10 t=0.323 alpha=175 theory= 173.0 diff=+2.0
+  i= 6 x=12 t=0.387 alpha=159 theory= 157.0 diff=+2.0
+  i= 7 x=14 t=0.452 alpha=143 theory= 140.0 diff=+3.0
+  i= 8 x=17 t=0.548 alpha=119 theory= 117.0 diff=+2.0
+  i= 9 x=19 t=0.613 alpha=103 theory= 100.0 diff=+3.0
+  i=10 x=21 t=0.677 alpha= 87 theory=  84.0 diff=+3.0
+  i=11 x=23 t=0.742 alpha= 71 theory=  67.0 diff=+4.0
+  i=12 x=25 t=0.806 alpha= 55 theory=  50.0 diff=+5.0
+  i=13 x=27 t=0.871 alpha= 39 theory=  33.0 diff=+6.0
+  i=14 x=29 t=0.935 alpha= 23 theory=  17.0 diff=+6.0
+  i=15 x=31 t=1.000 alpha=  7 theory=   0.0 diff=+7.0
