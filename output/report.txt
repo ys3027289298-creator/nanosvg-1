@@ -1,0 +1,18 @@
+[new] filterKind=1 enableBackground=1 blur=8.00 brightness=1.00 -> new.png
+[accumulate] filterKind=1 enableBackground=2 blur=8.00 brightness=1.00 -> accumulate.png
+[combo] filterKind=2 enableBackground=2 blur=6.00 brightness=1.60 -> combo.png
+  new        bbox=[10,50-189,150] 180x101 area=14941 avgRGBA=(226.39, 69.81, 69.81, 203.43)
+  accumulate bbox=[0,46-199,153] 200x108 area=20912 avgRGBA=(224.37, 50.30, 50.30, 164.38)
+  combo      bbox=[0,52-199,147] 200x96 area=18768 avgRGBA=(255.00, 74.77, 74.77, 174.18)
+[regression] no filter, no enable-background, pipeline bypassed
+  output     bbox=[74,74-125,125] 52x52 area=2188 avgRGBA=(31.85, 95.82, 223.79, 245.86)
+  check      byte-identical to plain nsvgRasterize: PASS
+[default] filter without enable-background, backdrop outside halo preserved
+  output     bbox=[10,56-189,143] 180x88 area=11882 avgRGBA=(168.48, 84.80, 165.75, 234.80)
+  check      backdrop outside halo untouched: PASS
+
+comparison:
+  accumulate vs new covered width:  200 vs 180 (expanded)
+  accumulate vs new covered height: 108 vs 101 (expanded)
+  accumulate vs new covered area:   20912 vs 14941
+  combo vs accumulate avg red:      255.00 vs 224.37 (brightness lifts it)

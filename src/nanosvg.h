@@ -112,6 +112,18 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+enum NSVGfilterKind {
+	NSVG_FILTER_NONE = 0,			// No filter attached to the shape.
+	NSVG_FILTER_GAUSSIAN_BLUR = 1,	// feGaussianBlur, stdDeviation stored in filterBlur.
+	NSVG_FILTER_COMBO = 2			// Gaussian blur followed by feColorMatrix brightness.
+};
+
+enum NSVGenableBackground {
+	NSVG_ENABLE_BG_DEFAULT = 0,		// Attribute absent, filter input is the shape itself.
+	NSVG_ENABLE_BG_NEW = 1,			// 'new': capture the canvas background for the region.
+	NSVG_ENABLE_BG_ACCUMULATE = 2	// 'accumulate': previously drawn content stays in the input.
+};
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -157,8 +169,12 @@ typedef struct NSVGshape
 	float miterLimit;			// Miter limit
 	char fillRule;				// Fill rule, see NSVGfillRule.
     unsigned char paintOrder;	// Encoded paint order (3×2-bit fields) see NSVGpaintOrder
+	unsigned char filterKind;	// See NSVGfilterKind.
+	unsigned char enableBackground; // Effective value, see NSVGenableBackground.
 	unsigned char flags;		// Logical or of NSVG_FLAGS_* flags
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
+	float filterBlur;			// Gaussian blur stdDeviation (scaled units), 0 when unused.
+	float filterBrightness;		// Linear RGB scale of the combo color matrix, 1 when unused.
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
 	float xform[6];				// Root transformation for fill/stroke gradient
@@ -170,6 +186,7 @@ typedef struct NSVGimage
 {
 	float width;				// Width of the image.
 	float height;				// Height of the image.
+	unsigned char enableBackground; // Root 'enable-background' value, see NSVGenableBackground.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
 } NSVGimage;
 
@@ -185,6 +202,22 @@ NSVGpath* nsvgDuplicatePath(NSVGpath* p);
 
 // Deletes an image.
 void nsvgDelete(NSVGimage* image);
+
+// Renders one filtered shape into an RGBA buffer (straight, non-premultiplied alpha).
+//   shape     - shape carrying the filter and its effective enable-background value
+//   dst       - full canvas buffer produced by nsvgRasterize(), modified in place
+//   w,h,stride - canvas dimensions and byte stride
+//   renderCb  - draws one shape isolated into the provided zeroed buffer, typically a
+//               small wrapper around nsvgRasterize()
+// The shape is rasterized alone, its filter is applied and the result composited
+// back. With NSVG_ENABLE_BG_ACCUMULATE the previously drawn content is merged into
+// the filter input and the processed region grows to cover it; NSVG_ENABLE_BG_NEW
+// captures the canvas background for the region instead. Returns 1 when applied.
+typedef void (*NSVGrenderShapeCb)(NSVGshape* shape, void* user,
+								  unsigned char* buf, int w, int h, int stride);
+
+int nsvgApplyShapeFilter(NSVGshape* shape, unsigned char* dst, int w, int h, int stride,
+						 NSVGrenderShapeCb renderCb, void* user);
 
 #ifndef NANOSVG_CPLUSPLUS
 #ifdef __cplusplus
@@ -446,6 +479,10 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	unsigned char filterKind;
+	float filterBlur;
+	float filterBrightness;
+	unsigned char enableBackground;
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -664,6 +701,10 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
+	p->attr[0].filterKind = NSVG_FILTER_NONE;
+	p->attr[0].filterBlur = 0.0f;
+	p->attr[0].filterBrightness = 1.0f;
+	p->attr[0].enableBackground = NSVG_ENABLE_BG_DEFAULT;
 
 	return p;
 
@@ -1006,6 +1047,12 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->fillRule = attr->fillRule;
 	shape->opacity = attr->opacity;
     shape->paintOrder = attr->paintOrder;
+	shape->filterKind = attr->filterKind;
+	shape->filterBlur = attr->filterBlur;
+	shape->filterBrightness = attr->filterBrightness;
+	shape->enableBackground = attr->enableBackground;
+	if (shape->enableBackground == NSVG_ENABLE_BG_DEFAULT)
+		shape->enableBackground = p->image->enableBackground;
 
 	shape->paths = p->plist;
 	p->plist = NULL;
@@ -1784,6 +1831,39 @@ static unsigned char nsvg__parsePaintOrder(const char* str)
 	return nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
 }
 
+// Parses the compact filter notation used by the rasterizer, e.g.
+// "blur(4)" or "blur(4) brightness(1.5)". Values are in user units and
+// are scaled together with the shape after the viewBox transform.
+static void nsvg__parseFilter(NSVGattrib* attr, const char* str)
+{
+	const char* blur = strstr(str, "blur(");
+	const char* bright = strstr(str, "brightness(");
+
+	if (blur == NULL)
+		return;
+
+	attr->filterBlur = (float)nsvg__atof(blur + 5);
+	if (attr->filterBlur < 0.0f)
+		attr->filterBlur = 0.0f;
+	attr->filterKind = NSVG_FILTER_GAUSSIAN_BLUR;
+
+	if (bright != NULL) {
+		attr->filterBrightness = (float)nsvg__atof(bright + 11);
+		if (attr->filterBrightness < 0.0f)
+			attr->filterBrightness = 0.0f;
+		attr->filterKind = NSVG_FILTER_COMBO;
+	}
+}
+
+static unsigned char nsvg__parseEnableBackground(const char* str)
+{
+	if (strncmp(str, "new", 3) == 0)
+		return NSVG_ENABLE_BG_NEW;
+	if (strncmp(str, "accumulate", 10) == 0)
+		return NSVG_ENABLE_BG_ACCUMULATE;
+	return NSVG_ENABLE_BG_DEFAULT;
+}
+
 static const char* nsvg__getNextDashItem(const char* s, char* it)
 {
 	int n = 0;
@@ -1927,6 +2007,11 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->id[63] = '\0';
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
+	} else if (strcmp(name, "filter") == 0) {
+		nsvg__parseFilter(attr, value);
+	} else if (strcmp(name, "enable-background") == 0 ||
+			   strcmp(name, "enableBackground") == 0) {
+		attr->enableBackground = nsvg__parseEnableBackground(value);
 	}
 	else {
 		return 0;
@@ -2670,7 +2755,9 @@ static void nsvg__parseSVG(NSVGparser* p, const char** attr)
 {
 	int i;
 	for (i = 0; attr[i]; i += 2) {
-		if (!nsvg__parseAttr(p, attr[i], attr[i + 1])) {
+		if (nsvg__parseAttr(p, attr[i], attr[i + 1]))
+			continue;
+		{
 			if (strcmp(attr[i], "width") == 0) {
 				p->image->width = nsvg__parseCoordinate(p, attr[i + 1], 0.0f, 0.0f);
 			} else if (strcmp(attr[i], "height") == 0) {
@@ -2719,6 +2806,9 @@ static void nsvg__parseSVG(NSVGparser* p, const char** attr)
 			}
 		}
 	}
+
+	// The root 'enable-background' applies to the whole document.
+	p->image->enableBackground = nsvg__getAttr(p)->enableBackground;
 }
 
 static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char type)
@@ -3137,6 +3227,7 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		shape->strokeDashOffset *= avgs;
 		for (i = 0; i < shape->strokeDashCount; i++)
 			shape->strokeDashArray[i] *= avgs;
+		shape->filterBlur *= avgs;
 	}
 }
 
@@ -3271,6 +3362,286 @@ void nsvgDelete(NSVGimage* image)
 		shape = snext;
 	}
 	free(image);
+}
+
+/*
+ * Filter pipeline
+ *
+ * Buffers are straight (non-premultiplied) RGBA, matching the output of
+ * nsvgRasterize(). The filter runs on a sub-rectangle of the canvas; pixels
+ * outside of it are never touched.
+ */
+
+static int nsvg__clampi(int v, int lo, int hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int nsvg__div255b(int x)
+{
+	return (x + (x >> 8) + 1) >> 8;
+}
+
+// Straight-alpha "over" composite of src onto dst for one pixel.
+static void nsvg__blendOver(unsigned char* dst, const unsigned char* src)
+{
+	int a = src[3];
+	int ia = 255 - a;
+	dst[0] = (unsigned char)nsvg__clampi(src[0] + nsvg__div255b(ia * dst[0]), 0, 255);
+	dst[1] = (unsigned char)nsvg__clampi(src[1] + nsvg__div255b(ia * dst[1]), 0, 255);
+	dst[2] = (unsigned char)nsvg__clampi(src[2] + nsvg__div255b(ia * dst[2]), 0, 255);
+	dst[3] = (unsigned char)nsvg__clampi(a + nsvg__div255b(ia * dst[3]), 0, 255);
+}
+
+// Straight -> premultiplied and back. Blurring premultiplied RGBA keeps the
+// color of semi-transparent halo pixels instead of fading toward black.
+static void nsvg__premultiply(unsigned char* img, int w, int h, int stride,
+							  int rx0, int ry0, int rx1, int ry1)
+{
+	int x, y;
+	NSVG_NOTUSED(w);
+	NSVG_NOTUSED(h);
+	for (y = ry0; y <= ry1; y++) {
+		unsigned char* row = img + y * stride;
+		for (x = rx0; x <= rx1; x++) {
+			unsigned char* px = &row[x * 4];
+			px[0] = (unsigned char)nsvg__div255b(px[0] * px[3]);
+			px[1] = (unsigned char)nsvg__div255b(px[1] * px[3]);
+			px[2] = (unsigned char)nsvg__div255b(px[2] * px[3]);
+		}
+	}
+}
+
+static void nsvg__unpremultiply(unsigned char* img, int w, int h, int stride,
+								int rx0, int ry0, int rx1, int ry1)
+{
+	int x, y;
+	NSVG_NOTUSED(w);
+	NSVG_NOTUSED(h);
+	for (y = ry0; y <= ry1; y++) {
+		unsigned char* row = img + y * stride;
+		for (x = rx0; x <= rx1; x++) {
+			unsigned char* px = &row[x * 4];
+			int a = px[3];
+			if (a != 0) {
+				px[0] = (unsigned char)nsvg__clampi(px[0] * 255 / a, 0, 255);
+				px[1] = (unsigned char)nsvg__clampi(px[1] * 255 / a, 0, 255);
+				px[2] = (unsigned char)nsvg__clampi(px[2] * 255 / a, 0, 255);
+			}
+		}
+	}
+}
+
+// One horizontal box-blur pass with edge clamping. Only the region rectangle
+// is processed and reads are clamped inside it, so passes can ping-pong
+// without ever sampling uninitialized pixels.
+static void nsvg__boxBlurH(const unsigned char* src, unsigned char* dst,
+						   int w, int h, int stride,
+						   int rx0, int ry0, int rx1, int ry1, int rad)
+{
+	int x, y, c;
+	NSVG_NOTUSED(w);
+	NSVG_NOTUSED(h);
+	for (y = ry0; y <= ry1; y++) {
+		const unsigned char* row = src + y * stride;
+		unsigned char* out = dst + y * stride;
+		int acc[4] = {0, 0, 0, 0};
+		for (x = rx0 - rad; x <= rx0 + rad; x++) {
+			const unsigned char* px = &row[nsvg__clampi(x, rx0, rx1) * 4];
+			for (c = 0; c < 4; c++) acc[c] += px[c];
+		}
+		for (x = rx0; x <= rx1; x++) {
+			int x0 = nsvg__clampi(x - rad, rx0, rx1);
+			int x1 = nsvg__clampi(x + rad, rx0, rx1);
+			int n = x1 - x0 + 1;
+			for (c = 0; c < 4; c++)
+				out[x*4+c] = (unsigned char)(acc[c] / n);
+			if (x < rx1) {
+				const unsigned char* add = &row[nsvg__clampi(x + 1 + rad, rx0, rx1) * 4];
+				const unsigned char* rem = &row[nsvg__clampi(x - rad, rx0, rx1) * 4];
+				for (c = 0; c < 4; c++) acc[c] += add[c] - rem[c];
+			}
+		}
+	}
+}
+
+// One vertical box-blur pass with edge clamping, restricted to the region rect.
+static void nsvg__boxBlurV(const unsigned char* src, unsigned char* dst,
+						   int w, int h, int stride,
+						   int rx0, int ry0, int rx1, int ry1, int rad)
+{
+	int x, y, c, yy;
+	NSVG_NOTUSED(w);
+	NSVG_NOTUSED(h);
+	for (y = ry0; y <= ry1; y++) {
+		unsigned char* out = dst + y * stride;
+		for (x = rx0; x <= rx1; x++) {
+			int acc[4] = {0, 0, 0, 0};
+			int y0 = nsvg__clampi(y - rad, ry0, ry1);
+			int y1v = nsvg__clampi(y + rad, ry0, ry1);
+			int n = y1v - y0 + 1;
+			for (yy = y0; yy <= y1v; yy++) {
+				const unsigned char* px = &src[yy * stride + x * 4];
+				for (c = 0; c < 4; c++) acc[c] += px[c];
+			}
+			for (c = 0; c < 4; c++)
+				out[x*4+c] = (unsigned char)(acc[c] / n);
+		}
+	}
+}
+
+// Coverage (alpha > threshold) bounding box of a canvas buffer, or all zeroes.
+static void nsvg__coverageBounds(const unsigned char* img, int w, int h, int stride,
+								 int threshold, int bounds[4])
+{
+	int x, y, found = 0;
+	bounds[0] = w; bounds[1] = h; bounds[2] = -1; bounds[3] = -1;
+	for (y = 0; y < h; y++) {
+		const unsigned char* row = img + y * stride;
+		for (x = 0; x < w; x++) {
+			if (row[x*4+3] > threshold) {
+				if (!found) {
+					bounds[0] = bounds[2] = x;
+					bounds[1] = bounds[3] = y;
+					found = 1;
+				} else {
+					if (x < bounds[0]) bounds[0] = x;
+					if (x > bounds[2]) bounds[2] = x;
+					if (y < bounds[1]) bounds[1] = y;
+					if (y > bounds[3]) bounds[3] = y;
+				}
+			}
+		}
+	}
+	if (!found) {
+		bounds[0] = bounds[1] = 0;
+		bounds[2] = bounds[3] = -1;
+	}
+}
+
+int nsvgApplyShapeFilter(NSVGshape* shape, unsigned char* dst, int w, int h, int stride,
+						 NSVGrenderShapeCb renderCb, void* user)
+{
+	unsigned char *layer, *work, *tmp, *backup;
+	int region[4], margin, rad, x, y;
+
+	if (shape == NULL || shape->filterKind == NSVG_FILTER_NONE || renderCb == NULL)
+		return 0;
+	if (w <= 0 || h <= 0 || stride < w * 4)
+		return 0;
+
+	layer = (unsigned char*)calloc((size_t)w * h, 4);
+	work = (unsigned char*)malloc((size_t)stride * h);
+	tmp = (unsigned char*)malloc((size_t)stride * h);
+	backup = (unsigned char*)malloc((size_t)stride * h);
+	if (layer == NULL || work == NULL || tmp == NULL || backup == NULL) {
+		free(layer); free(work); free(tmp); free(backup);
+		return 0;
+	}
+
+	// Rasterize the shape on its own so the filter input is never polluted by
+	// the neighboring shapes already sitting in dst.
+	renderCb(shape, user, layer, w, h, stride);
+
+	// The blur spreads roughly three standard deviations past the shape.
+	margin = shape->filterBlur > 0.0f ? (int)ceilf(shape->filterBlur * 3.0f) : 0;
+	if (shape->filterBlur > 0.0f && margin < 1)
+		margin = 1;
+
+	region[0] = (int)floorf(shape->bounds[0]) - margin;
+	region[1] = (int)floorf(shape->bounds[1]) - margin;
+	region[2] = (int)ceilf(shape->bounds[2]) + margin;
+	region[3] = (int)ceilf(shape->bounds[3]) + margin;
+
+	if (shape->enableBackground == NSVG_ENABLE_BG_ACCUMULATE) {
+		// Merge everything painted so far into the filter input and grow the
+		// processed region to cover it, blur spread included.
+		int bg[4];
+		nsvg__coverageBounds(dst, w, h, stride, 16, bg);
+		if (bg[2] >= bg[0]) {
+			region[0] = nsvg__minf(region[0], bg[0] - margin);
+			region[1] = nsvg__minf(region[1], bg[1] - margin);
+			region[2] = nsvg__maxf(region[2], bg[2] + margin);
+			region[3] = nsvg__maxf(region[3], bg[3] + margin);
+		}
+	}
+
+	region[0] = nsvg__clampi(region[0], 0, w-1);
+	region[1] = nsvg__clampi(region[1], 0, h-1);
+	region[2] = nsvg__clampi(region[2], 0, w-1);
+	region[3] = nsvg__clampi(region[3], 0, h-1);
+	if (region[2] < region[0] || region[3] < region[1]) {
+		free(layer); free(work); free(tmp); free(backup);
+		return 0;
+	}
+
+	// Keep the unfiltered canvas so the filtered result replaces, rather than
+	// stacks on top of, the content that was folded into the filter input.
+	memcpy(backup, dst, (size_t)stride * h);
+
+	if (shape->enableBackground != NSVG_ENABLE_BG_DEFAULT) {
+		// 'new' and 'accumulate' both expose the current canvas background;
+		// the difference is the region computed above.
+		for (y = region[1]; y <= region[3]; y++) {
+			for (x = region[0]; x <= region[2]; x++) {
+				nsvg__blendOver(&layer[y*stride + x*4],
+								&dst[y*stride + x*4]);
+			}
+		}
+	}
+
+	memcpy(work, layer, (size_t)stride * h);
+	nsvg__premultiply(work, w, h, stride, region[0], region[1], region[2], region[3]);
+
+	if (shape->filterBlur > 0.0f) {
+		// Three box passes approximate the Gaussian (sigma ~= rad / sqrt(3)).
+		rad = (int)ceilf(shape->filterBlur * 1.5f);
+		if (rad < 1) rad = 1;
+		nsvg__boxBlurH(work, tmp, w, h, stride,
+					   region[0], region[1], region[2], region[3], rad);
+		nsvg__boxBlurV(tmp, work, w, h, stride,
+					   region[0], region[1], region[2], region[3], rad);
+		nsvg__boxBlurH(work, tmp, w, h, stride,
+					   region[0], region[1], region[2], region[3], rad);
+		nsvg__boxBlurV(tmp, work, w, h, stride,
+					   region[0], region[1], region[2], region[3], rad);
+		nsvg__boxBlurH(work, tmp, w, h, stride,
+					   region[0], region[1], region[2], region[3], rad);
+		nsvg__boxBlurV(tmp, work, w, h, stride,
+					   region[0], region[1], region[2], region[3], rad);
+	}
+
+	nsvg__unpremultiply(work, w, h, stride, region[0], region[1], region[2], region[3]);
+
+	if (shape->filterKind == NSVG_FILTER_COMBO) {
+		for (y = region[1]; y <= region[3]; y++) {
+			unsigned char* row = work + y * stride;
+			for (x = region[0]; x <= region[2]; x++) {
+				unsigned char* px = &row[x*4];
+				px[0] = (unsigned char)nsvg__clampi(
+					(int)(px[0] * shape->filterBrightness), 0, 255);
+				px[1] = (unsigned char)nsvg__clampi(
+					(int)(px[1] * shape->filterBrightness), 0, 255);
+				px[2] = (unsigned char)nsvg__clampi(
+					(int)(px[2] * shape->filterBrightness), 0, 255);
+			}
+		}
+	}
+
+	// Restore the untouched backdrop once, then composite the filter output.
+	memcpy(dst, backup, (size_t)stride * h);
+	for (y = region[1]; y <= region[3]; y++) {
+		for (x = region[0]; x <= region[2]; x++) {
+			nsvg__blendOver(&dst[y*stride + x*4],
+							&work[y*stride + x*4]);
+		}
+	}
+
+	free(layer);
+	free(work);
+	free(tmp);
+	free(backup);
+	return 1;
 }
 
 #endif // NANOSVG_IMPLEMENTATION
