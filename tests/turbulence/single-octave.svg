@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <filter id="noise1">
+      <feTurbulence type="fractalNoise" baseFrequency="0.1" numOctaves="1" seed="7"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" filter="url(#noise1)"/>
+</svg>

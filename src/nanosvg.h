@@ -133,6 +133,19 @@ typedef struct NSVGpaint {
 	};
 } NSVGpaint;
 
+typedef struct NSVGfilter
+{
+	char id[64];				// Optional 'id' attr of the filter
+	char hasTurbulence;			// Set if the filter contains an feTurbulence primitive
+	char turbType;				// feTurbulence 'type': 0 = fractalNoise, 1 = turbulence
+	char stitchTiles;			// feTurbulence 'stitchTiles': 0 = noStitch, 1 = stitch
+	float baseFrequencyX;		// feTurbulence 'baseFrequency', x component
+	float baseFrequencyY;		// feTurbulence 'baseFrequency', y component
+	int numOctaves;				// feTurbulence 'numOctaves'
+	unsigned int seed;			// feTurbulence 'seed'
+	struct NSVGfilter* next;	// Pointer to next filter, or NULL if last element.
+} NSVGfilter;
+
 typedef struct NSVGpath
 {
 	float* pts;					// Cubic bezier points: x0,y0, [cpx1,cpx1,cpx2,cpy2,x1,y1], ...
@@ -161,6 +174,7 @@ typedef struct NSVGshape
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	char filter[64];			// Optional 'id' of filter applied to the shape
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
@@ -171,6 +185,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGfilter* filters;		// Linked list of filters in the image.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -430,6 +445,7 @@ typedef struct NSVGattrib
 	float strokeOpacity;
 	char fillGradient[64];
 	char strokeGradient[64];
+	char filter[64];
 	float strokeWidth;
 	float strokeDashOffset;
 	float strokeDashArray[NSVG_MAX_DASHES];
@@ -467,6 +483,8 @@ typedef struct NSVGparser
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
 	NSVGshape* shapesTail;
+	NSVGfilter* filtersTail;
+	NSVGfilter* curFilter;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
 	float dpi;
@@ -993,6 +1011,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->filter, attr->filter, sizeof shape->filter);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1909,6 +1928,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->miterLimit = nsvg__parseMiterLimit(value);
 	} else if (strcmp(name, "fill-rule") == 0) {
 		attr->fillRule = nsvg__parseFillRule(value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filter, value);
 	} else if (strcmp(name, "font-size") == 0) {
 		attr->fontSize = nsvg__parseCoordinate(p, value, 0.0f, nsvg__actualLength(p));
 	} else if (strcmp(name, "transform") == 0) {
@@ -2833,6 +2855,66 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseFilter(NSVGparser* p, const char** attr)
+{
+	int i;
+	NSVGfilter* filter = (NSVGfilter*)malloc(sizeof(NSVGfilter));
+	if (filter == NULL) return;
+	memset(filter, 0, sizeof(NSVGfilter));
+	filter->numOctaves = 1;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(filter->id, attr[i+1], 63);
+			filter->id[63] = '\0';
+		}
+	}
+
+	if (p->image->filters == NULL)
+		p->image->filters = filter;
+	else
+		p->filtersTail->next = filter;
+	p->filtersTail = filter;
+	p->curFilter = filter;
+}
+
+static void nsvg__parseBaseFrequency(NSVGfilter* filter, const char* str)
+{
+	char* end = NULL;
+	double fx = strtod(str, &end);
+	double fy = fx;
+	if (end != str) {
+		while (*end && (nsvg__isspace(*end) || *end == ',')) end++;
+		if (*end)
+			fy = strtod(end, NULL);
+	}
+	filter->baseFrequencyX = (float)fx;
+	filter->baseFrequencyY = (float)fy;
+}
+
+static void nsvg__parseFeTurbulence(NSVGparser* p, const char** attr)
+{
+	NSVGfilter* filter = p->curFilter;
+	int i;
+	if (filter == NULL) return;
+	filter->hasTurbulence = 1;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "type") == 0) {
+			filter->turbType = (strcmp(attr[i+1], "turbulence") == 0) ? 1 : 0;
+		} else if (strcmp(attr[i], "baseFrequency") == 0) {
+			nsvg__parseBaseFrequency(filter, attr[i+1]);
+		} else if (strcmp(attr[i], "numOctaves") == 0) {
+			filter->numOctaves = atoi(attr[i+1]);
+			if (filter->numOctaves < 1) filter->numOctaves = 1;
+		} else if (strcmp(attr[i], "seed") == 0) {
+			filter->seed = (unsigned int)strtoul(attr[i+1], NULL, 10);
+		} else if (strcmp(attr[i], "stitchTiles") == 0) {
+			filter->stitchTiles = (strcmp(attr[i+1], "stitch") == 0) ? 1 : 0;
+		}
+	}
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
@@ -2845,6 +2927,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 			nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 		} else if (strcmp(el, "stop") == 0) {
 			nsvg__parseGradientStop(p, attr);
+		} else if (strcmp(el, "filter") == 0) {
+			nsvg__parseFilter(p, attr);
+		} else if (strcmp(el, "feTurbulence") == 0) {
+			nsvg__parseFeTurbulence(p, attr);
 		} else if (strcmp(el, "style") == 0) {
 			p->styleFlag = 1;
 		}
@@ -2890,6 +2976,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 	} else if (strcmp(el, "stop") == 0) {
 		nsvg__parseGradientStop(p, attr);
+	} else if (strcmp(el, "filter") == 0) {
+		nsvg__parseFilter(p, attr);
+	} else if (strcmp(el, "feTurbulence") == 0) {
+		nsvg__parseFeTurbulence(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
 	} else if (strcmp(el, "svg") == 0) {
@@ -2909,6 +2999,8 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->pathFlag = 0;
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 0;
+	} else if (strcmp(el, "filter") == 0) {
+		p->curFilter = NULL;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
 	}
@@ -3260,6 +3352,7 @@ error:
 void nsvgDelete(NSVGimage* image)
 {
 	NSVGshape *snext, *shape;
+	NSVGfilter *fnext, *filter;
 	if (image == NULL) return;
 	shape = image->shapes;
 	while (shape != NULL) {
@@ -3269,6 +3362,12 @@ void nsvgDelete(NSVGimage* image)
 		nsvg__deletePaint(&shape->stroke);
 		free(shape);
 		shape = snext;
+	}
+	filter = image->filters;
+	while (filter != NULL) {
+		fnext = filter->next;
+		free(filter);
+		filter = fnext;
 	}
 	free(image);
 }

@@ -1372,6 +1372,173 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+#define NSVG__TURB_BSIZE 256
+#define NSVG__TURB_BM 0xff
+#define NSVG__TURB_PERLIN_N 4096.0f
+
+typedef struct NSVGturbState {
+	long randSeed;
+	unsigned char perm[NSVG__TURB_BSIZE];
+	float gradient[NSVG__TURB_BSIZE][4][2];
+} NSVGturbState;
+
+// Deterministic pseudo-random generator (Schrage's algorithm, as referenced by the SVG spec).
+// Same seed always produces the same sequence, no system randomness involved.
+static long nsvg__turbRandom(NSVGturbState* st)
+{
+	long result = 16807 * (st->randSeed % 127773) - 2836 * (st->randSeed / 127773);
+	if (result <= 0) result += 2147483647;
+	st->randSeed = result;
+	return result;
+}
+
+static void nsvg__turbSetup(NSVGturbState* st, unsigned int seed)
+{
+	int i, j, k;
+	st->randSeed = (long)seed;
+	nsvg__turbRandom(st); nsvg__turbRandom(st); nsvg__turbRandom(st); nsvg__turbRandom(st);
+	for (i = 0; i < NSVG__TURB_BSIZE; i++)
+		st->perm[i] = (unsigned char)i;
+	for (i = 0; i < NSVG__TURB_BSIZE; i++) {
+		unsigned char tmp;
+		j = (int)(nsvg__turbRandom(st) & NSVG__TURB_BM);
+		tmp = st->perm[i]; st->perm[i] = st->perm[j]; st->perm[j] = tmp;
+	}
+	for (i = 0; i < NSVG__TURB_BSIZE; i++)
+		for (j = 0; j < 4; j++)
+			for (k = 0; k < 2; k++)
+				st->gradient[i][j][k] = (float)(nsvg__turbRandom(st) % (2*NSVG__TURB_BSIZE) - NSVG__TURB_BSIZE) / NSVG__TURB_BSIZE;
+}
+
+static float nsvg__turbSCurve(float t)
+{
+	return t * t * (3.0f - 2.0f * t);
+}
+
+static float nsvg__turbNoise2(NSVGturbState* st, int channel, float x, float y)
+{
+	float t, rx0, rx1, ry0, ry1, sx, sy, u, v, a, b;
+	const float* q;
+	int bx0, bx1, by0, by1, b00, b10, b01, b11, i, j;
+
+	t = x + NSVG__TURB_PERLIN_N;
+	bx0 = (int)t; bx1 = bx0 + 1;
+	rx0 = t - (int)t; rx1 = rx0 - 1.0f;
+	t = y + NSVG__TURB_PERLIN_N;
+	by0 = (int)t; by1 = by0 + 1;
+	ry0 = t - (int)t; ry1 = ry0 - 1.0f;
+
+	i = st->perm[bx0 & NSVG__TURB_BM];
+	j = st->perm[bx1 & NSVG__TURB_BM];
+	b00 = st->perm[(i + by0) & NSVG__TURB_BM];
+	b10 = st->perm[(j + by0) & NSVG__TURB_BM];
+	b01 = st->perm[(i + by1) & NSVG__TURB_BM];
+	b11 = st->perm[(j + by1) & NSVG__TURB_BM];
+
+	sx = nsvg__turbSCurve(rx0);
+	sy = nsvg__turbSCurve(ry0);
+
+	q = st->gradient[b00][channel]; u = rx0*q[0] + ry0*q[1];
+	q = st->gradient[b10][channel]; v = rx1*q[0] + ry0*q[1];
+	a = u + sx*(v - u);
+	q = st->gradient[b01][channel]; u = rx0*q[0] + ry1*q[1];
+	q = st->gradient[b11][channel]; v = rx1*q[0] + ry1*q[1];
+	b = u + sx*(v - u);
+
+	return a + sy*(b - a);
+}
+
+static float nsvg__turbulence(NSVGturbState* st, int channel, float x, float y,
+							  float baseFreqX, float baseFreqY, int numOctaves, int fractal)
+{
+	float sum = 0.0f, freq = 1.0f, amp = 1.0f;
+	int oct;
+	for (oct = 0; oct < numOctaves; oct++) {
+		float n = nsvg__turbNoise2(st, channel, x * baseFreqX * freq, y * baseFreqY * freq);
+		sum += (fractal ? n : fabsf(n)) * amp;
+		amp *= 0.5f; // per spec, each octave's amplitude is halved
+		freq *= 2.0f;
+	}
+	return sum;
+}
+
+static NSVGfilter* nsvg__findFilter(NSVGimage* image, const char* id)
+{
+	NSVGfilter* filter = image->filters;
+	while (filter != NULL) {
+		if (strcmp(filter->id, id) == 0)
+			return filter;
+		filter = filter->next;
+	}
+	return NULL;
+}
+
+// Rasterizes an feTurbulence filter output over the filter region (default:
+// shape bounds expanded by 10% on each side) and composites it source-over.
+static void nsvg__rasterizeTurbulence(NSVGrasterizer* r, NSVGshape* shape, NSVGfilter* filter,
+									  float tx, float ty, float scale)
+{
+	NSVGturbState* st;
+	float bw = shape->bounds[2] - shape->bounds[0];
+	float bh = shape->bounds[3] - shape->bounds[1];
+	float fw, fh, baseFreqX, baseFreqY, opacity, uy;
+	int x0, y0, x1, y1, x, y, chan;
+
+	if (bw <= 0.0f || bh <= 0.0f || scale == 0.0f) return;
+	fw = bw * 1.2f;
+	fh = bh * 1.2f;
+	baseFreqX = filter->baseFrequencyX;
+	baseFreqY = filter->baseFrequencyY;
+	opacity = shape->opacity < 0.0f ? 0.0f : (shape->opacity > 1.0f ? 1.0f : shape->opacity);
+
+	if (filter->stitchTiles) {
+		// Adjust base frequency so an integer number of lattice cells fits the tile.
+		baseFreqX = floorf(baseFreqX * fw + 0.5f) / fw;
+		baseFreqY = floorf(baseFreqY * fh + 0.5f) / fh;
+	}
+
+	st = (NSVGturbState*)malloc(sizeof(NSVGturbState));
+	if (st == NULL) return;
+	nsvg__turbSetup(st, filter->seed);
+
+	x0 = (int)(tx + (shape->bounds[0] - bw * 0.1f) * scale);
+	y0 = (int)(ty + (shape->bounds[1] - bh * 0.1f) * scale);
+	x1 = (int)(tx + (shape->bounds[2] + bw * 0.1f) * scale) + 1;
+	y1 = (int)(ty + (shape->bounds[3] + bh * 0.1f) * scale) + 1;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > r->width) x1 = r->width;
+	if (y1 > r->height) y1 = r->height;
+
+	for (y = y0; y < y1; y++) {
+		unsigned char* row = &r->bitmap[y * r->stride];
+		uy = ((y + 0.5f) - ty) / scale;
+		for (x = x0; x < x1; x++) {
+			float ux = ((x + 0.5f) - tx) / scale;
+			unsigned char* d = &row[x * 4];
+			unsigned int sa, inv;
+			unsigned char rgba[4];
+			for (chan = 0; chan < 4; chan++) {
+				float v = nsvg__turbulence(st, chan, ux, uy, baseFreqX, baseFreqY,
+										   filter->numOctaves, !filter->turbType);
+				if (!filter->turbType)
+					v = v * 0.5f + 0.5f;
+				v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+				rgba[chan] = (unsigned char)(v * 255.0f + 0.5f);
+			}
+			// Composite source-over in premultiplied space.
+			sa = (unsigned int)(rgba[3] * opacity);
+			inv = 255 - sa;
+			d[0] = (unsigned char)(rgba[0] * sa / 255 + d[0] * inv / 255);
+			d[1] = (unsigned char)(rgba[1] * sa / 255 + d[1] * inv / 255);
+			d[2] = (unsigned char)(rgba[2] * sa / 255 + d[2] * inv / 255);
+			d[3] = (unsigned char)(sa + d[3] * inv / 255);
+		}
+	}
+
+	free(st);
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
@@ -1400,6 +1567,15 @@ void nsvgRasterize(NSVGrasterizer* r,
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
+
+		if (shape->filter[0] != '\0') {
+			NSVGfilter* filter = nsvg__findFilter(image, shape->filter);
+			if (filter != NULL && filter->hasTurbulence) {
+				// The feTurbulence result is the filter output; it replaces the source graphic.
+				nsvg__rasterizeTurbulence(r, shape, filter, tx, ty, scale);
+				continue;
+			}
+		}
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;

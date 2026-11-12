@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <filter id="seedA">
+      <feTurbulence type="fractalNoise" baseFrequency="0.09" numOctaves="2" seed="1"/>
+    </filter>
+    <filter id="seedB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.09" numOctaves="2" seed="2"/>
+    </filter>
+  </defs>
+  <rect x="4" y="16" width="56" height="96" filter="url(#seedA)"/>
+  <rect x="68" y="16" width="56" height="96" filter="url(#seedB)"/>
+</svg>
