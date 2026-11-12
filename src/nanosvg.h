@@ -446,6 +446,7 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char paintOrderStyled;	// Set when paint-order came from a style, which wins over the attribute.
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -473,6 +474,7 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	char parsingStyle;
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -1768,20 +1770,33 @@ static char nsvg__parseFillRule(const char* str)
 
 static unsigned char nsvg__parsePaintOrder(const char* str)
 {
-	if (strcmp(str, "normal") == 0 || strcmp(str, "fill stroke markers") == 0)
-		return nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
-	else if (strcmp(str, "fill markers stroke") == 0)
-		return nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_MARKERS, NSVG_PAINT_STROKE);
-	else if (strcmp(str, "markers fill stroke") == 0)
-		return nsvg__encodePaintOrder(NSVG_PAINT_MARKERS, NSVG_PAINT_FILL, NSVG_PAINT_STROKE);
-	else if (strcmp(str, "markers stroke fill") == 0)
-		return nsvg__encodePaintOrder(NSVG_PAINT_MARKERS, NSVG_PAINT_STROKE, NSVG_PAINT_FILL);
-	else if (strcmp(str, "stroke fill markers") == 0)
-		return nsvg__encodePaintOrder(NSVG_PAINT_STROKE, NSVG_PAINT_FILL, NSVG_PAINT_MARKERS);
-	else if (strcmp(str, "stroke markers fill") == 0)
-		return nsvg__encodePaintOrder(NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS, NSVG_PAINT_FILL);
-	// TODO: handle inherit.
-	return nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
+	// Default order used to append paint operations missing from the list.
+	static const unsigned char def[3] = { NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS };
+	unsigned char order[3];
+	unsigned char seen[3] = { 0, 0, 0 };
+	char it[16];
+	int n = 0, i;
+
+	while (*str) {
+		while (*str && nsvg__isspace(*str)) str++;
+		if (*str == '\0') break;
+		i = 0;
+		while (*str && !nsvg__isspace(*str)) {
+			if (i < 15) it[i++] = *str;
+			str++;
+		}
+		it[i] = '\0';
+		if (strcmp(it, "normal") == 0)
+			break;
+		else if (strcmp(it, "fill") == 0 && !seen[0]) { order[n++] = NSVG_PAINT_FILL; seen[0] = 1; }
+		else if (strcmp(it, "stroke") == 0 && !seen[1]) { order[n++] = NSVG_PAINT_STROKE; seen[1] = 1; }
+		else if (strcmp(it, "markers") == 0 && !seen[2]) { order[n++] = NSVG_PAINT_MARKERS; seen[2] = 1; }
+	}
+	// Paint operations not listed are painted last, in their default order.
+	for (i = 0; i < 3; i++) {
+		if (!seen[i]) order[n++] = def[i];
+	}
+	return nsvg__encodePaintOrder(order[0], order[1], order[2]);
 }
 
 static const char* nsvg__getNextDashItem(const char* s, char* it)
@@ -1921,7 +1936,11 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 	} else if (strcmp(name, "offset") == 0) {
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
-		attr->paintOrder = nsvg__parsePaintOrder(value);
+		if (!attr->paintOrderStyled) {
+			attr->paintOrder = nsvg__parsePaintOrder(value);
+			if (p->parsingStyle)
+				attr->paintOrderStyled = 1;
+		}
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -1971,6 +1990,7 @@ static void nsvg__parseStyle(NSVGparser* p, const char* str)
 	const char* start;
 	const char* end;
 
+	p->parsingStyle = 1;
 	while (*str) {
 		// Left Trim
 		while(*str && nsvg__isspace(*str)) ++str;
@@ -1985,6 +2005,7 @@ static void nsvg__parseStyle(NSVGparser* p, const char* str)
 		nsvg__parseNameValue(p, start, end);
 		if (*str) ++str;
 	}
+	p->parsingStyle = 0;
 }
 
 static void nsvg__parseAttribs(NSVGparser* p, const char** attr)
