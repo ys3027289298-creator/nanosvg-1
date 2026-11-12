@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">
+  <filter id="spot" filterUnits="userSpaceOnUse" x="0" y="0" width="400" height="400">
+    <feDiffuseLighting in="SourceGraphic" lighting-color="white" diffuseConstant="1" surfaceScale="1" result="d">
+      <feSpotLight x="200" y="200" z="100" pointsAtX="260" pointsAtY="200" pointsAtZ="0" limitingConeAngle="20" specularExponent="1"/>
+    </feDiffuseLighting>
+    <feSpecularLighting in="SourceGraphic" lighting-color="white" specularConstant="1" specularExponent="1" surfaceScale="1" result="s">
+      <feSpotLight x="200" y="200" z="100" pointsAtX="260" pointsAtY="200" pointsAtZ="0" limitingConeAngle="20" specularExponent="1"/>
+    </feSpecularLighting>
+    <feMerge><feMergeNode in="d"/><feMergeNode in="s"/></feMerge>
+  </filter>
+  <rect width="400" height="400" fill="black" filter="url(#spot)"/>
+</svg>
