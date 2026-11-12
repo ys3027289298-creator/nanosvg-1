@@ -112,6 +112,25 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+enum NSVGlightingType {
+	NSVG_LIGHT_DISTANT = 0,		// feDistantLight
+	NSVG_LIGHT_POINT = 1		// fePointLight
+};
+
+// Parsed 'feDiffuseLighting' filter primitive.
+typedef struct NSVGdiffuseLighting
+{
+	char id[64];				// 'id' of the filter element.
+	float surfaceScale;			// 'surfaceScale' attribute.
+	float diffuseConstant;		// 'diffuseConstant' attribute.
+	unsigned int color;			// 'lighting-color' as 0xRRGGBB.
+	char lightType;				// One of NSVGlightingType.
+	float azimuth;				// feDistantLight azimuth (radians).
+	float elevation;			// feDistantLight elevation (radians).
+	float x, y, z;				// fePointLight position in user units.
+	struct NSVGdiffuseLighting* next;
+} NSVGdiffuseLighting;
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -161,6 +180,8 @@ typedef struct NSVGshape
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	char filter[64];			// Optional 'id' referenced by the 'filter' attribute.
+	NSVGdiffuseLighting* lighting; // Resolved feDiffuseLighting, or NULL.
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
@@ -171,6 +192,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGdiffuseLighting* lights; // Parsed feDiffuseLighting filters.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -185,6 +207,15 @@ NSVGpath* nsvgDuplicatePath(NSVGpath* p);
 
 // Deletes an image.
 void nsvgDelete(NSVGimage* image);
+
+// Applies the 'feDiffuseLighting' filters attached to the image onto an RGBA
+// buffer produced by nsvgRasterize() (non-premultiplied alpha, 4 bytes per
+// pixel). The surface height is reconstructed from the coverage (alpha)
+// channel, surface normals are computed from height differences, and the
+// resulting diffuse light intensity is multiplied onto the color channels.
+// Images without lighting filters are left byte-for-byte untouched.
+void nsvgApplyDiffuseLighting(NSVGimage* image, unsigned char* pixels,
+							  int w, int h, int stride);
 
 #ifndef NANOSVG_CPLUSPLUS
 #ifdef __cplusplus
@@ -446,6 +477,7 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char filter[64];
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -467,7 +499,11 @@ typedef struct NSVGparser
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
 	NSVGshape* shapesTail;
+	NSVGdiffuseLighting* lights;
+	NSVGdiffuseLighting* curLight;	// feDiffuseLighting currently open.
+	char curFilterId[64];			// id of the open <filter> container.
 	float viewMinx, viewMiny, viewWidth, viewHeight;
+	float viewScaleX, viewScaleY;	// Final user-unit to pixel scale.
 	int alignX, alignY, alignType;
 	float dpi;
 	char pathFlag;
@@ -718,6 +754,11 @@ static void nsvg__deleteParser(NSVGparser* p)
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		while (p->lights != NULL) {
+			NSVGdiffuseLighting* next = p->lights->next;
+			free(p->lights);
+			p->lights = next;
+		}
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -993,6 +1034,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->filter, attr->filter, sizeof shape->filter);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1927,6 +1969,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->id[63] = '\0';
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filter, value);
 	}
 	else {
 		return 0;
@@ -2833,12 +2878,98 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseFilter(NSVGparser* p, const char** attr)
+{
+	int i;
+	p->curFilterId[0] = '\0';
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(p->curFilterId, attr[i+1], 63);
+			p->curFilterId[63] = '\0';
+			return;
+		}
+	}
+}
+
+static void nsvg__parseDiffuseLighting(NSVGparser* p, const char** attr)
+{
+	int i;
+	NSVGdiffuseLighting* light = (NSVGdiffuseLighting*)malloc(sizeof(NSVGdiffuseLighting));
+	if (light == NULL) return;
+	memset(light, 0, sizeof(NSVGdiffuseLighting));
+	light->surfaceScale = 1.0f;
+	light->diffuseConstant = 1.0f;
+	light->color = NSVG_RGB(255, 255, 255);
+	light->lightType = NSVG_LIGHT_DISTANT;
+	strncpy(light->id, p->curFilterId, 63);
+	light->id[63] = '\0';
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(light->id, attr[i+1], 63);
+			light->id[63] = '\0';
+		} else if (strcmp(attr[i], "surfaceScale") == 0) {
+			light->surfaceScale = nsvg__atof(attr[i+1]);
+		} else if (strcmp(attr[i], "diffuseConstant") == 0) {
+			light->diffuseConstant = nsvg__atof(attr[i+1]);
+		} else if (strcmp(attr[i], "lighting-color") == 0) {
+			light->color = nsvg__parseColor(attr[i+1]);
+		}
+	}
+	light->next = p->lights;
+	p->lights = light;
+	p->curLight = light;
+}
+
+static void nsvg__parseLightSource(NSVGparser* p, const char* el, const char** attr)
+{
+	int i;
+	if (p->curLight == NULL)
+		return;
+	if (strcmp(el, "feDistantLight") == 0) {
+		p->curLight->lightType = NSVG_LIGHT_DISTANT;
+		for (i = 0; attr[i]; i += 2) {
+			if (strcmp(attr[i], "azimuth") == 0)
+				p->curLight->azimuth = nsvg__atof(attr[i+1]) * NSVG_PI / 180.0f;
+			else if (strcmp(attr[i], "elevation") == 0)
+				p->curLight->elevation = nsvg__atof(attr[i+1]) * NSVG_PI / 180.0f;
+		}
+	} else if (strcmp(el, "fePointLight") == 0) {
+		p->curLight->lightType = NSVG_LIGHT_POINT;
+		for (i = 0; attr[i]; i += 2) {
+			if (strcmp(attr[i], "x") == 0)
+				p->curLight->x = nsvg__atof(attr[i+1]);
+			else if (strcmp(attr[i], "y") == 0)
+				p->curLight->y = nsvg__atof(attr[i+1]);
+			else if (strcmp(attr[i], "z") == 0)
+				p->curLight->z = nsvg__atof(attr[i+1]);
+		}
+	}
+}
+
+// Returns 1 when the element is a lighting filter element handled here.
+static int nsvg__parseLightingElement(NSVGparser* p, const char* el, const char** attr)
+{
+	if (strcmp(el, "filter") == 0) {
+		nsvg__parseFilter(p, attr);
+		return 1;
+	} else if (strcmp(el, "feDiffuseLighting") == 0) {
+		nsvg__parseDiffuseLighting(p, attr);
+		return 1;
+	} else if (strcmp(el, "feDistantLight") == 0 || strcmp(el, "fePointLight") == 0) {
+		nsvg__parseLightSource(p, el, attr);
+		return 1;
+	}
+	return 0;
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
 	if (p->defsFlag) {
 		// Skip everything but gradients and styles in defs
+		if (nsvg__parseLightingElement(p, el, attr))
+			return;
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
 		} else if (strcmp(el, "radialGradient") == 0) {
@@ -2850,6 +2981,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		}
 		return;
 	}
+
+	// Lighting filters may also be defined outside of <defs>.
+	if (nsvg__parseLightingElement(p, el, attr))
+		return;
 
 	if (strcmp(el, "g") == 0) {
 		nsvg__pushAttr(p);
@@ -2911,6 +3046,8 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
+	} else if (strcmp(el, "feDiffuseLighting") == 0) {
+		p->curLight = NULL;
 	}
 }
 
@@ -3105,6 +3242,8 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 	sx *= us;
 	sy *= us;
 	avgs = (sx+sy) / 2.0f;
+	p->viewScaleX = sx;
+	p->viewScaleY = sy;
 	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
 		shape->bounds[0] = (shape->bounds[0] + tx) * sx;
 		shape->bounds[1] = (shape->bounds[1] + ty) * sy;
@@ -3170,6 +3309,38 @@ static void nsvg__createGradients(NSVGparser* p)
 	}
 }
 
+static void nsvg__resolveLights(NSVGparser* p)
+{
+	NSVGshape* shape;
+	NSVGdiffuseLighting* light;
+
+	// Point light coordinates are given in user units; bring them to the same
+	// pixel space the rasterizer uses (the same transform as the geometry).
+	for (light = p->lights; light != NULL; light = light->next) {
+		if (light->lightType == NSVG_LIGHT_POINT) {
+			light->x *= p->viewScaleX;
+			light->y *= p->viewScaleY;
+			light->z *= (p->viewScaleX + p->viewScaleY) * 0.5f;
+		}
+	}
+
+	// Attach the referenced feDiffuseLighting to each shape.
+	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
+		if (shape->filter[0] == '\0')
+			continue;
+		for (light = p->lights; light != NULL; light = light->next) {
+			if (strcmp(light->id, shape->filter) == 0) {
+				shape->lighting = light;
+				break;
+			}
+		}
+	}
+
+	// Hand the parsed filters over to the image so they outlive the parser.
+	p->image->lights = p->lights;
+	p->lights = NULL;
+}
+
 NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 {
 	NSVGparser* p;
@@ -3188,6 +3359,9 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 
 	// Scale to viewBox
 	nsvg__scaleToViewbox(p, units);
+
+	// Resolve feDiffuseLighting references after scaling.
+	nsvg__resolveLights(p);
 
 	ret = p->image;
 	p->image = NULL;
@@ -3270,7 +3444,156 @@ void nsvgDelete(NSVGimage* image)
 		free(shape);
 		shape = snext;
 	}
+	while (image->lights != NULL) {
+		NSVGdiffuseLighting* lnext = image->lights->next;
+		free(image->lights);
+		image->lights = lnext;
+	}
 	free(image);
+}
+
+static NSVG_INLINE int nsvg__lightClampi(int v, int mn, int mx)
+{
+	if (v < mn) return mn;
+	if (v > mx) return mx;
+	return v;
+}
+
+static float nsvg__lightNormalize3(float* x, float* y, float* z)
+{
+	float len = sqrtf((*x)*(*x) + (*y)*(*y) + (*z)*(*z));
+	if (len > 1e-10f) {
+		*x /= len;
+		*y /= len;
+		*z /= len;
+	} else {
+		*x = 0.0f;
+		*y = 0.0f;
+		*z = 1.0f;
+		len = 1.0f;
+	}
+	return len;
+}
+
+static float nsvg__lightIntensity(const NSVGdiffuseLighting* light,
+								  float nx, float ny, float nz, int px, int py)
+{
+	float lx, ly, lz, dot;
+
+	if (light->lightType == NSVG_LIGHT_DISTANT) {
+		// SVG 1.1 feDistantLight: direction pointing towards the light source.
+		lx = cosf(light->elevation) * cosf(light->azimuth);
+		ly = cosf(light->elevation) * sinf(light->azimuth);
+		lz = sinf(light->elevation);
+	} else {
+		// SVG 1.1 fePointLight: vector from the surface point to the light.
+		lx = light->x - (float)px;
+		ly = light->y - (float)py;
+		lz = light->z;
+		nsvg__lightNormalize3(&lx, &ly, &lz);
+	}
+
+	dot = nx*lx + ny*ly + nz*lz;
+	if (dot < 0.0f) dot = 0.0f;
+	return light->diffuseConstant * dot;
+}
+
+void nsvgApplyDiffuseLighting(NSVGimage* image, unsigned char* pixels,
+							  int w, int h, int stride)
+{
+	NSVGshape* shape;
+	float* height = NULL;
+	int haveLight = 0;
+
+	if (image == NULL || pixels == NULL || w <= 0 || h <= 0)
+		return;
+
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		if (shape->lighting != NULL) { haveLight = 1; break; }
+	}
+	if (!haveLight)
+		return;		// No filter involved: output stays byte-for-byte identical.
+
+	height = (float*)malloc((size_t)w * (size_t)h * sizeof(float));
+	if (height == NULL)
+		return;
+
+	// Reconstruct the bump surface from the coverage (alpha) channel. The
+	// SourceGraphic alpha is 1 inside the filled geometry and ramps over the
+	// antialiased silhouette, so surfaceScale * alpha gives a raised surface.
+	{
+		int x, y;
+		for (y = 0; y < h; y++) {
+			unsigned char* row = &pixels[(size_t)y * stride];
+			for (x = 0; x < w; x++) {
+				height[y*w + x] = (float)row[x*4 + 3] / 255.0f;
+			}
+		}
+	}
+
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		NSVGdiffuseLighting* light = shape->lighting;
+		int x, y;
+		float lr, lg, lb;
+
+		if (light == NULL)
+			continue;
+
+		// lighting-color, normalized to the 0..1 range.
+		lr = (float)(light->color & 0xff) / 255.0f;
+		lg = (float)((light->color >> 8) & 0xff) / 255.0f;
+		lb = (float)((light->color >> 16) & 0xff) / 255.0f;
+
+		// Walk the whole frame: the bump surface is the full-image height
+		// field, and pixels with zero coverage are skipped below.
+		for (y = 0; y < h; y++) {
+			unsigned char* dst = &pixels[(size_t)y * stride];
+			for (x = 0; x < w; x++, dst += 4) {
+				int xl, xr, yt, yb;
+				float hl, hr, ht, hb, nx, ny, nz, intensity;
+
+				if (dst[3] == 0)
+					continue;	// Nothing was rasterized here.
+
+				{
+					float fr, fg, fb;
+
+					// Central differences of the surface height (edge clamped).
+					xl = nsvg__lightClampi(x-1, 0, w-1);
+					xr = nsvg__lightClampi(x+1, 0, w-1);
+					yt = nsvg__lightClampi(y-1, 0, h-1);
+					yb = nsvg__lightClampi(y+1, 0, h-1);
+					hl = height[y*w + xl] * light->surfaceScale;
+					hr = height[y*w + xr] * light->surfaceScale;
+					ht = height[yt*w + x] * light->surfaceScale;
+					hb = height[yb*w + x] * light->surfaceScale;
+
+					// Normal of the height field z = surfaceScale * alpha(x,y):
+					// the gradient (dz/dx, dz/dy) points uphill, z points up.
+					nx = (hr - hl) * 0.5f;
+					ny = (hb - ht) * 0.5f;
+					nz = 1.0f;
+					nsvg__lightNormalize3(&nx, &ny, &nz);
+
+					intensity = nsvg__lightIntensity(light, nx, ny, nz, x, y);
+
+					// Multiply the lighting color onto the input color.
+					fr = (float)dst[0] * lr * intensity;
+					fg = (float)dst[1] * lg * intensity;
+					fb = (float)dst[2] * lb * intensity;
+
+					if (fr > 255.0f) fr = 255.0f;
+					if (fg > 255.0f) fg = 255.0f;
+					if (fb > 255.0f) fb = 255.0f;
+					dst[0] = (unsigned char)fr;
+					dst[1] = (unsigned char)fg;
+					dst[2] = (unsigned char)fb;
+				}
+			}
+		}
+	}
+
+	free(height);
 }
 
 #endif // NANOSVG_IMPLEMENTATION

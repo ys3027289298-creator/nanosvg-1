@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- feDiffuseLighting with fePointLight placed above the top-left corner. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <filter id="bump" filterUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <feDiffuseLighting surfaceScale="4" diffuseConstant="1" lighting-color="#ffffff">
+        <fePointLight x="12" y="12" z="20"/>
+      </feDiffuseLighting>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="48" height="48" fill="#808080" filter="url(#bump)"/>
+</svg>

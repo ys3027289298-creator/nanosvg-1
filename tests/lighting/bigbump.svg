@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Large surfaceScale: steep silhouette normals, exercises clamping and
+     the diffuseConstant multiplier together with a colored lighting-color. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <filter id="bump" filterUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <feDiffuseLighting surfaceScale="16" diffuseConstant="1.25" lighting-color="#ffd0a0">
+        <feDistantLight azimuth="270" elevation="60"/>
+      </feDiffuseLighting>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="48" height="48" fill="#406080" filter="url(#bump)"/>
+</svg>

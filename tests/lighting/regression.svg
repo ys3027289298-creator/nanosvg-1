@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- No filter at all: output must stay byte-identical to the baseline. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect x="8" y="8" width="20" height="20" fill="#e63946"/>
+  <circle cx="44" cy="44" r="12" fill="#1d3557"/>
+</svg>

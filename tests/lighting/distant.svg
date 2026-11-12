@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- feDiffuseLighting with feDistantLight: slope facing the light source
+     should be brighter, the opposite slope darker. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <filter id="bump" filterUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <feDiffuseLighting surfaceScale="4" diffuseConstant="1" lighting-color="#ffffff">
+        <feDistantLight azimuth="0" elevation="45"/>
+      </feDiffuseLighting>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="48" height="48" fill="#808080" filter="url(#bump)"/>
+</svg>

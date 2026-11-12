@@ -26,13 +26,14 @@
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvgrast.h"
 
-int main()
+int main(int argc, char** argv)
 {
 	NSVGimage *image = NULL;
 	NSVGrasterizer *rast = NULL;
 	unsigned char* img = NULL;
 	int w, h;
-	const char* filename = "../example/23.svg";
+	const char* filename = argc > 1 ? argv[1] : "../example/23.svg";
+	const char* outname = argc > 2 ? argv[2] : "svg.png";
 
 	printf("parsing %s\n", filename);
 	image = nsvgParseFromFile(filename, "px", 96.0f);
@@ -58,8 +59,26 @@ int main()
 	printf("rasterizing image %d x %d\n", w, h);
 	nsvgRasterize(rast, image, 0,0,1, img, w, h, w*4);
 
+	// Apply feDiffuseLighting filters (no-op when the SVG uses none).
+	nsvgApplyDiffuseLighting(image, img, w, h, w*4);
+
 	printf("writing svg.png\n");
- 	stbi_write_png("svg.png", w, h, 4, img, w*4);
+ 	stbi_write_png(outname, w, h, 4, img, w*4);
+	{
+		// Raw RGBA dump next to the PNG for headless pixel inspection.
+		char rawname[1024];
+		const char* rawbase = argc > 2 ? argv[2] : "svg.png";
+		FILE* fp;
+		size_t rawlen = strlen(rawbase);
+		if (rawlen > 4 && strcmp(rawbase + rawlen - 4, ".png") == 0)
+			rawlen -= 4;
+		snprintf(rawname, sizeof(rawname), "%.*s.rgba", (int)rawlen, rawbase);
+		fp = fopen(rawname, "wb");
+		if (fp != NULL) {
+			fwrite(img, 1, (size_t)w*h*4, fp);
+			fclose(fp);
+		}
+	}
 
 error:
 	nsvgDeleteRasterizer(rast);
