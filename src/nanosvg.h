@@ -112,6 +112,11 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+enum NSVGvectorEffect {
+	NSVG_VECTOREFFECT_NONE = 0,
+	NSVG_VECTOREFFECT_NONSCALINGSTROKE = 1,
+};
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -154,6 +159,7 @@ typedef struct NSVGshape
 	char strokeDashCount;		// Number of dash values in dash array.
 	char strokeLineJoin;		// Stroke join type.
 	char strokeLineCap;			// Stroke cap type.
+	char vectorEffect;			// Vector effect, see NSVGvectorEffect.
 	float miterLimit;			// Miter limit
 	char fillRule;				// Fill rule, see NSVGfillRule.
     unsigned char paintOrder;	// Encoded paint order (3×2-bit fields) see NSVGpaintOrder
@@ -436,6 +442,7 @@ typedef struct NSVGattrib
 	int strokeDashCount;
 	char strokeLineJoin;
 	char strokeLineCap;
+	char vectorEffect;
 	float miterLimit;
 	char fillRule;
 	float fontSize;
@@ -995,6 +1002,9 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
+	shape->vectorEffect = attr->vectorEffect;
+	if (attr->vectorEffect == NSVG_VECTOREFFECT_NONSCALINGSTROKE)
+		scale = 1.0f;
 	shape->strokeWidth = attr->strokeWidth * scale;
 	shape->strokeDashOffset = attr->strokeDashOffset * scale;
 	shape->strokeDashCount = (char)attr->strokeDashCount;
@@ -1756,6 +1766,15 @@ static char nsvg__parseLineJoin(const char* str)
 	return NSVG_JOIN_MITER;
 }
 
+static char nsvg__parseVectorEffect(const char* str)
+{
+	if (strstr(str, "non-scaling-stroke") != NULL)
+		return NSVG_VECTOREFFECT_NONSCALINGSTROKE;
+	// "none", "non-scaling-size", screen-space effects and unknown values
+	// all keep the stroke measured in user units.
+	return NSVG_VECTOREFFECT_NONE;
+}
+
 static char nsvg__parseFillRule(const char* str)
 {
 	if (strcmp(str, "nonzero") == 0)
@@ -1907,6 +1926,8 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->strokeLineJoin = nsvg__parseLineJoin(value);
 	} else if (strcmp(name, "stroke-miterlimit") == 0) {
 		attr->miterLimit = nsvg__parseMiterLimit(value);
+	} else if (strcmp(name, "vector-effect") == 0) {
+		attr->vectorEffect = nsvg__parseVectorEffect(value);
 	} else if (strcmp(name, "fill-rule") == 0) {
 		attr->fillRule = nsvg__parseFillRule(value);
 	} else if (strcmp(name, "font-size") == 0) {
@@ -3133,10 +3154,12 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 			nsvg__xformInverse(shape->stroke.gradient->xform, t);
 		}
 
-		shape->strokeWidth *= avgs;
-		shape->strokeDashOffset *= avgs;
-		for (i = 0; i < shape->strokeDashCount; i++)
-			shape->strokeDashArray[i] *= avgs;
+		if (shape->vectorEffect != NSVG_VECTOREFFECT_NONSCALINGSTROKE) {
+			shape->strokeWidth *= avgs;
+			shape->strokeDashOffset *= avgs;
+			for (i = 0; i < shape->strokeDashCount; i++)
+				shape->strokeDashArray[i] *= avgs;
+		}
 	}
 }
 

@@ -1,0 +1,6 @@
+case                            width_px   dev_px     dash/gap     expected
+01_1x_nonscaling                    6.00    +0.00     14/10        14/10   
+02_2x_viewbox_nonscaling            6.00    +0.00     14/10        14/10   
+03_2x_transform_nonscaling          6.00    +0.00     14/10        14/10   
+04_2x_regression_default           12.00    +0.00     28/20        28/20   
+RESULT: PASS
