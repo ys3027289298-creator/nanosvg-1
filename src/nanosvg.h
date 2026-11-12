@@ -665,6 +665,11 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].visible = 1;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
 
+	// SVG default for preserveAspectRatio is xMidYMid meet.
+	p->alignX = NSVG_ALIGN_MID;
+	p->alignY = NSVG_ALIGN_MID;
+	p->alignType = NSVG_ALIGN_MEET;
+
 	return p;
 
 error:
@@ -2693,27 +2698,36 @@ static void nsvg__parseSVG(NSVGparser* p, const char** attr)
 				s = nsvg__parseNumber(s, buf, 64);
 				p->viewHeight = nsvg__atof(buf);
 			} else if (strcmp(attr[i], "preserveAspectRatio") == 0) {
-				if (strstr(attr[i + 1], "none") != 0) {
+				char par[64];
+				int j;
+				size_t parLen = strlen(attr[i + 1]);
+				if (parLen >= sizeof(par)) parLen = sizeof(par) - 1;
+				for (j = 0; (size_t)j < parLen; j++) {
+					char ch = attr[i + 1][j];
+					par[j] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+				}
+				par[parLen] = '\0';
+				if (strstr(par, "none") != 0) {
 					// No uniform scaling
 					p->alignType = NSVG_ALIGN_NONE;
 				} else {
 					// Parse X align
-					if (strstr(attr[i + 1], "xMin") != 0)
+					if (strstr(par, "xmin") != 0)
 						p->alignX = NSVG_ALIGN_MIN;
-					else if (strstr(attr[i + 1], "xMid") != 0)
+					else if (strstr(par, "xmid") != 0)
 						p->alignX = NSVG_ALIGN_MID;
-					else if (strstr(attr[i + 1], "xMax") != 0)
+					else if (strstr(par, "xmax") != 0)
 						p->alignX = NSVG_ALIGN_MAX;
-					// Parse X align
-					if (strstr(attr[i + 1], "yMin") != 0)
+					// Parse Y align
+					if (strstr(par, "ymin") != 0)
 						p->alignY = NSVG_ALIGN_MIN;
-					else if (strstr(attr[i + 1], "yMid") != 0)
+					else if (strstr(par, "ymid") != 0)
 						p->alignY = NSVG_ALIGN_MID;
-					else if (strstr(attr[i + 1], "yMax") != 0)
+					else if (strstr(par, "ymax") != 0)
 						p->alignY = NSVG_ALIGN_MAX;
 					// Parse meet/slice
 					p->alignType = NSVG_ALIGN_MEET;
-					if (strstr(attr[i + 1], "slice") != 0)
+					if (strstr(par, "slice") != 0)
 						p->alignType = NSVG_ALIGN_SLICE;
 				}
 			}
