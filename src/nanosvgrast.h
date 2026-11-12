@@ -60,6 +60,7 @@ NSVGrasterizer* nsvgCreateRasterizer(void);
 //   w - width of the image to render
 //   h - height of the image to render
 //   stride - number of bytes per scaleline in the destination buffer
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride);
@@ -1372,16 +1373,138 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+#define NSVG__MAX_FILTER_BUFFERS 32
+
+typedef struct NSVGfilterBuffer {
+	char name[64];
+	unsigned char* data;
+} NSVGfilterBuffer;
+
+static NSVGfilter* nsvg__findFilter(NSVGimage* image, const char* id)
+{
+	NSVGfilter* filter = image->filters;
+	while (filter != NULL) {
+		if (strcmp(filter->id, id) == 0)
+			return filter;
+		filter = filter->next;
+	}
+	return NULL;
+}
+
+static unsigned char* nsvg__findFilterBuffer(NSVGfilterBuffer* bufs, int nbufs, const char* name)
+{
+	int i;
+	for (i = nbufs-1; i >= 0; i--) {
+		if (bufs[i].name[0] != '\0' && strcmp(bufs[i].name, name) == 0)
+			return bufs[i].data;
+	}
+	return NULL;
+}
+
+// Source-over composites premultiplied src over premultiplied dst.
+static void nsvg__compositeOver(unsigned char* dst, const unsigned char* src, int w, int h, int stride)
+{
+	int x, y;
+	for (y = 0; y < h; y++) {
+		unsigned char* drow = &dst[y*stride];
+		const unsigned char* srow = &src[y*stride];
+		for (x = 0; x < w; x++) {
+			int sa = srow[3];
+			if (sa == 255) {
+				drow[0] = srow[0]; drow[1] = srow[1]; drow[2] = srow[2]; drow[3] = 255;
+			} else if (sa != 0) {
+				int inv = 255 - sa;
+				drow[0] = (unsigned char)(srow[0] + (drow[0]*inv + 127)/255);
+				drow[1] = (unsigned char)(srow[1] + (drow[1]*inv + 127)/255);
+				drow[2] = (unsigned char)(srow[2] + (drow[2]*inv + 127)/255);
+				drow[3] = (unsigned char)(sa + (drow[3]*inv + 127)/255);
+			}
+			drow += 4;
+			srow += 4;
+		}
+	}
+}
+
+static void nsvg__rasterizeShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale);
+
+static void nsvg__applyFilter(NSVGrasterizer* r, NSVGshape* shape, NSVGfilter* filter, float tx, float ty, float scale)
+{
+	int w = r->width, h = r->height, stride = r->stride;
+	NSVGfilterBuffer bufs[NSVG__MAX_FILTER_BUFFERS];
+	int nbufs = 0, i, x, y;
+	NSVGfilterPrimitive* prim;
+	unsigned char* output = NULL;
+	int x0, y0, x1, y1;
+
+	// Filter region: shape bounds in device space, clipped to canvas.
+	x0 = (int)floorf(tx + shape->bounds[0]*scale); if (x0 < 0) x0 = 0;
+	y0 = (int)floorf(ty + shape->bounds[1]*scale); if (y0 < 0) y0 = 0;
+	x1 = (int)ceilf(tx + shape->bounds[2]*scale); if (x1 > w) x1 = w;
+	y1 = (int)ceilf(ty + shape->bounds[3]*scale); if (y1 > h) y1 = h;
+
+	// Render the shape itself (SourceGraphic) into its own buffer.
+	if (nbufs < NSVG__MAX_FILTER_BUFFERS) {
+		unsigned char* saved;
+		unsigned char* src = (unsigned char*)calloc(1, stride*h);
+		if (src == NULL) return;
+		saved = r->bitmap;
+		r->bitmap = src;
+		nsvg__rasterizeShape(r, shape, tx, ty, scale);
+		r->bitmap = saved;
+		strcpy(bufs[nbufs].name, "SourceGraphic");
+		bufs[nbufs].data = src;
+		nbufs++;
+		output = src;
+	}
+
+	for (prim = filter->prims; prim != NULL; prim = prim->next) {
+		unsigned char* buf;
+		if (nbufs >= NSVG__MAX_FILTER_BUFFERS) break;
+		buf = (unsigned char*)calloc(1, stride*h);
+		if (buf == NULL) break;
+
+		if (prim->type == NSVG_FILTER_FLOOD) {
+			int a = (prim->color >> 24) & 0xff;
+			unsigned char fr = (unsigned char)(((prim->color & 0xff) * a + 127) / 255);
+			unsigned char fg = (unsigned char)((((prim->color >> 8) & 0xff) * a + 127) / 255);
+			unsigned char fb = (unsigned char)((((prim->color >> 16) & 0xff) * a + 127) / 255);
+			for (y = y0; y < y1; y++) {
+				unsigned char* row = &buf[y*stride + x0*4];
+				for (x = x0; x < x1; x++) {
+					row[0] = fr; row[1] = fg; row[2] = fb; row[3] = (unsigned char)a;
+					row += 4;
+				}
+			}
+		} else if (prim->type == NSVG_FILTER_MERGE) {
+			// Stack inputs in document order, later inputs cover earlier ones.
+			// Inputs referencing unknown results are treated as transparent.
+			for (i = 0; i < prim->ninputs; i++) {
+				unsigned char* in = nsvg__findFilterBuffer(bufs, nbufs, prim->inputs[i]);
+				if (in != NULL)
+					nsvg__compositeOver(buf, in, w, h, stride);
+			}
+		}
+
+		// Register the result so later primitives can reference it by name.
+		memcpy(bufs[nbufs].name, prim->result, 64);
+		bufs[nbufs].data = buf;
+		nbufs++;
+		output = buf;
+	}
+
+	if (output != NULL)
+		nsvg__compositeOver(r->bitmap, output, w, h, stride);
+
+	for (i = 0; i < nbufs; i++)
+		free(bufs[i].data);
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
 {
 	NSVGshape *shape = NULL;
-	NSVGedge *e = NULL;
-	NSVGcachedPaint cache;
 	int i;
-    int j;
-    unsigned char paintOrder;
 
 	r->bitmap = dst;
 	r->width = w;
@@ -1400,6 +1523,33 @@ void nsvgRasterize(NSVGrasterizer* r,
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
+
+		if (shape->filter[0] != '\0') {
+			NSVGfilter* filter = nsvg__findFilter(image, shape->filter);
+			if (filter != NULL) {
+				nsvg__applyFilter(r, shape, filter, tx, ty, scale);
+				continue;
+			}
+		}
+
+		nsvg__rasterizeShape(r, shape, tx, ty, scale);
+	}
+
+	nsvg__unpremultiplyAlpha(dst, w, h, stride);
+
+	r->bitmap = NULL;
+	r->width = 0;
+	r->height = 0;
+	r->stride = 0;
+}
+
+static void nsvg__rasterizeShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale)
+{
+	NSVGedge *e = NULL;
+	NSVGcachedPaint cache;
+	int i;
+    int j;
+    unsigned char paintOrder;
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1457,14 +1607,6 @@ void nsvgRasterize(NSVGrasterizer* r,
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
         }
-	}
-
-	nsvg__unpremultiplyAlpha(dst, w, h, stride);
-
-	r->bitmap = NULL;
-	r->width = 0;
-	r->height = 0;
-	r->stride = 0;
 }
 
 #endif // NANOSVGRAST_IMPLEMENTATION

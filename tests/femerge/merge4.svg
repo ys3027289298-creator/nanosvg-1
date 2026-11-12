@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
+  <defs>
+    <filter id="f">
+      <feFlood flood-color="#ff0000" flood-opacity="0.5" result="a"/>
+      <feFlood flood-color="#00ff00" flood-opacity="0.5" result="b"/>
+      <feFlood flood-color="#0000ff" flood-opacity="0.5" result="c"/>
+      <feFlood flood-color="#ffffff" flood-opacity="0.25" result="d"/>
+      <feMerge result="m">
+        <feMergeNode in="a"/>
+        <feMergeNode in="b"/>
+      </feMerge>
+      <feMerge>
+        <feMergeNode in="m"/>
+        <feMergeNode in="c"/>
+        <feMergeNode in="d"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="10" y="10" width="80" height="80" fill="#00ff00" filter="url(#f)"/>
+</svg>
