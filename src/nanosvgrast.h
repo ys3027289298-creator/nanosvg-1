@@ -60,6 +60,9 @@ NSVGrasterizer* nsvgCreateRasterizer(void);
 //   w - width of the image to render
 //   h - height of the image to render
 //   stride - number of bytes per scaleline in the destination buffer
+static void nsvg__rasterizeShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale);
+static void nsvg__rasterizeFilteredShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale);
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride);
@@ -1377,11 +1380,7 @@ void nsvgRasterize(NSVGrasterizer* r,
 				   unsigned char* dst, int w, int h, int stride)
 {
 	NSVGshape *shape = NULL;
-	NSVGedge *e = NULL;
-	NSVGcachedPaint cache;
 	int i;
-    int j;
-    unsigned char paintOrder;
 
 	r->bitmap = dst;
 	r->width = w;
@@ -1400,6 +1399,30 @@ void nsvgRasterize(NSVGrasterizer* r,
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
+
+		if (shape->filter[0] != '\0') {
+			nsvg__rasterizeFilteredShape(r, shape, tx, ty, scale);
+			continue;
+		}
+
+		nsvg__rasterizeShape(r, shape, tx, ty, scale);
+	}
+
+	nsvg__unpremultiplyAlpha(dst, w, h, stride);
+
+	r->bitmap = NULL;
+	r->width = 0;
+	r->height = 0;
+	r->stride = 0;
+}
+
+static void nsvg__rasterizeShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale)
+{
+	NSVGedge *e = NULL;
+	NSVGcachedPaint cache;
+	int i;
+    int j;
+    unsigned char paintOrder;
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1457,14 +1480,146 @@ void nsvgRasterize(NSVGrasterizer* r,
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
         }
+}
+
+// Box blur pass with sliding window, pixels outside the buffer are transparent.
+static void nsvg__boxBlurH(unsigned char* img, int w, int h, int radius)
+{
+	unsigned char* src;
+	int x, y, c, d = 2*radius + 1;
+	if (radius <= 0) return;
+	src = (unsigned char*)malloc(w*4);
+	if (src == NULL) return;
+	for (y = 0; y < h; y++) {
+		unsigned char* row = img + y*w*4;
+		int sum[4] = {0, 0, 0, 0};
+		memcpy(src, row, w*4);
+		for (x = 0; x <= radius; x++)
+			for (c = 0; c < 4; c++)
+				sum[c] += src[x*4+c];
+		for (x = 0; x < w; x++) {
+			int add = x + radius + 1, rem = x - radius;
+			for (c = 0; c < 4; c++)
+				row[x*4+c] = (unsigned char)((sum[c] + d/2) / d);
+			if (add < w)
+				for (c = 0; c < 4; c++) sum[c] += src[add*4+c];
+			if (rem >= 0)
+				for (c = 0; c < 4; c++) sum[c] -= src[rem*4+c];
+		}
+	}
+	free(src);
+}
+
+static void nsvg__boxBlurV(unsigned char* img, int w, int h, int radius)
+{
+	unsigned char* src;
+	int x, y, c, d = 2*radius + 1;
+	if (radius <= 0) return;
+	src = (unsigned char*)malloc(h*4);
+	if (src == NULL) return;
+	for (x = 0; x < w; x++) {
+		int sum[4] = {0, 0, 0, 0};
+		for (y = 0; y < h; y++)
+			memcpy(&src[y*4], &img[(y*w + x)*4], 4);
+		for (y = 0; y <= radius; y++)
+			for (c = 0; c < 4; c++)
+				sum[c] += src[y*4+c];
+		for (y = 0; y < h; y++) {
+			int add = y + radius + 1, rem = y - radius;
+			for (c = 0; c < 4; c++)
+				img[(y*w + x)*4+c] = (unsigned char)((sum[c] + d/2) / d);
+			if (add < h)
+				for (c = 0; c < 4; c++) sum[c] += src[add*4+c];
+			if (rem >= 0)
+				for (c = 0; c < 4; c++) sum[c] -= src[rem*4+c];
+		}
+	}
+	free(src);
+}
+
+// Approximate gaussian blur with three box blur passes.
+// Converts gaussian sigma to three box blur radii.
+static void nsvg__gaussBoxes(float sigma, int* radii)
+{
+	float ideal;
+	int wl, m, i;
+	if (sigma < 0.5f) {
+		radii[0] = radii[1] = radii[2] = 0;
+		return;
+	}
+	ideal = sqrtf(12.0f*sigma*sigma/3.0f + 1.0f);
+	wl = (int)floorf(ideal);
+	if ((wl & 1) == 0) wl--;
+	if (wl < 1) wl = 1;
+	m = (int)(0.5f + (12.0f*sigma*sigma - 3.0f*wl*wl - 12.0f*wl - 9.0f) / (float)(-4*wl - 4));
+	for (i = 0; i < 3; i++)
+		radii[i] = ((i < m ? wl + 2 : wl) - 1) / 2;
+}
+
+static void nsvg__gaussBlur(unsigned char* img, int w, int h, float sx, float sy)
+{
+	int i;
+	int rx[3], ry[3];
+	if (sx <= 0.0f && sy <= 0.0f) return;
+	nsvg__gaussBoxes(sx, rx);
+	nsvg__gaussBoxes(sy, ry);
+	for (i = 0; i < 3; i++) {
+		nsvg__boxBlurH(img, w, h, rx[i]);
+		nsvg__boxBlurV(img, w, h, ry[i]);
+	}
+}
+
+// Renders a filtered shape: rasterize to an offscreen buffer covering the filter
+// region, blur it, then composite over the destination. The filter region clips
+// the result, matching how browsers apply filterUnits/primitiveUnits.
+static void nsvg__rasterizeFilteredShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale)
+{
+	unsigned char* tmp;
+	unsigned char* dstBitmap;
+	int dstWidth, dstHeight, dstStride;
+	float fx0, fy0, fx1, fy1;
+	int ix0, iy0, ix1, iy1, tw, th, x, y;
+
+	fx0 = shape->filterRegion[0] * scale + tx;
+	fy0 = shape->filterRegion[1] * scale + ty;
+	fx1 = (shape->filterRegion[0] + shape->filterRegion[2]) * scale + tx;
+	fy1 = (shape->filterRegion[1] + shape->filterRegion[3]) * scale + ty;
+	ix0 = (int)floorf(fx0); iy0 = (int)floorf(fy0);
+	ix1 = (int)ceilf(fx1);  iy1 = (int)ceilf(fy1);
+	if (ix0 < 0) ix0 = 0;
+	if (iy0 < 0) iy0 = 0;
+	if (ix1 > r->width) ix1 = r->width;
+	if (iy1 > r->height) iy1 = r->height;
+	tw = ix1 - ix0;
+	th = iy1 - iy0;
+	if (tw <= 0 || th <= 0) return;
+
+	tmp = (unsigned char*)calloc(tw*th*4, 1);
+	if (tmp == NULL) return;
+
+	dstBitmap = r->bitmap; dstWidth = r->width; dstHeight = r->height; dstStride = r->stride;
+	r->bitmap = tmp; r->width = tw; r->height = th; r->stride = tw*4;
+	nsvg__rasterizeShape(r, shape, tx - ix0, ty - iy0, scale);
+	r->bitmap = dstBitmap; r->width = dstWidth; r->height = dstHeight; r->stride = dstStride;
+
+	nsvg__gaussBlur(tmp, tw, th, shape->filterStdDev[0] * scale, shape->filterStdDev[1] * scale);
+
+	// Blend premultiplied source over premultiplied destination.
+	for (y = 0; y < th; y++) {
+		unsigned char* s = tmp + y*tw*4;
+		unsigned char* d = r->bitmap + (iy0 + y)*r->stride + ix0*4;
+		for (x = 0; x < tw; x++) {
+			int ia = 255 - s[3];
+			d[0] = (unsigned char)(s[0] + nsvg__div255(ia * (int)d[0]));
+			d[1] = (unsigned char)(s[1] + nsvg__div255(ia * (int)d[1]));
+			d[2] = (unsigned char)(s[2] + nsvg__div255(ia * (int)d[2]));
+			d[3] = (unsigned char)(s[3] + nsvg__div255(ia * (int)d[3]));
+			s += 4;
+			d += 4;
+		}
 	}
 
-	nsvg__unpremultiplyAlpha(dst, w, h, stride);
-
-	r->bitmap = NULL;
-	r->width = 0;
-	r->height = 0;
-	r->stride = 0;
+	free(tmp);
 }
 
 #endif // NANOSVGRAST_IMPLEMENTATION

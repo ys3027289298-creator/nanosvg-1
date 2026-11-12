@@ -162,6 +162,9 @@ typedef struct NSVGshape
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
 	float xform[6];				// Root transformation for fill/stroke gradient
+	char filter[64];			// Optional 'id' of filter
+	float filterRegion[4];		// Filter effect region [x,y,w,h] in user units (valid if filter is set).
+	float filterStdDev[2];		// Gaussian blur standard deviation in user units.
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
 } NSVGshape;
@@ -419,6 +422,16 @@ typedef struct NSVGgradientData
 	struct NSVGgradientData* next;
 } NSVGgradientData;
 
+typedef struct NSVGfilterData
+{
+	char id[64];
+	NSVGcoordinate x, y, width, height;	// Filter region, in filterUnits.
+	char units;							// filterUnits: NSVG_USER_SPACE or NSVG_OBJECT_SPACE (default).
+	char primitiveUnits;				// primitiveUnits: NSVG_USER_SPACE (default) or NSVG_OBJECT_SPACE.
+	float stdDeviation[2];				// feGaussianBlur stdDeviation, in primitiveUnits.
+	struct NSVGfilterData* next;
+} NSVGfilterData;
+
 typedef struct NSVGattrib
 {
 	char id[64];
@@ -430,6 +443,7 @@ typedef struct NSVGattrib
 	float strokeOpacity;
 	char fillGradient[64];
 	char strokeGradient[64];
+	char filter[64];
 	float strokeWidth;
 	float strokeDashOffset;
 	float strokeDashArray[NSVG_MAX_DASHES];
@@ -466,6 +480,7 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGfilterData* filters;
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -712,12 +727,36 @@ static void nsvg__deleteGradientData(NSVGgradientData* grad)
 	}
 }
 
+static void nsvg__deleteFilterData(NSVGfilterData* flt)
+{
+	NSVGfilterData* next;
+	while (flt != NULL) {
+		next = flt->next;
+		free(flt);
+		flt = next;
+	}
+}
+
+static NSVGfilterData* nsvg__findFilterData(NSVGparser* p, const char* id)
+{
+	NSVGfilterData* flt = p->filters;
+	if (id == NULL || *id == '\0')
+		return NULL;
+	while (flt != NULL) {
+		if (strcmp(flt->id, id) == 0)
+			return flt;
+		flt = flt->next;
+	}
+	return NULL;
+}
+
 static void nsvg__deleteParser(NSVGparser* p)
 {
 	if (p != NULL) {
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		nsvg__deleteFilterData(p->filters);
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -993,6 +1032,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->filter, attr->filter, sizeof shape->filter);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1901,6 +1941,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->strokeDashOffset = nsvg__parseCoordinate(p, value, 0.0f, nsvg__actualLength(p));
 	} else if (strcmp(name, "stroke-opacity") == 0) {
 		attr->strokeOpacity = nsvg__parseOpacity(value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filter, value);
 	} else if (strcmp(name, "stroke-linecap") == 0) {
 		attr->strokeLineCap = nsvg__parseLineCap(value);
 	} else if (strcmp(name, "stroke-linejoin") == 0) {
@@ -2833,18 +2876,87 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseFilter(NSVGparser* p, const char** attr)
+{
+	int i;
+	NSVGfilterData* flt = (NSVGfilterData*)malloc(sizeof(NSVGfilterData));
+	if (flt == NULL) return;
+	memset(flt, 0, sizeof(NSVGfilterData));
+	// Default filter region is -10%,-10% 120%x120% of the referenced bounding box.
+	flt->x = nsvg__coord(-10.0f, NSVG_UNITS_PERCENT);
+	flt->y = nsvg__coord(-10.0f, NSVG_UNITS_PERCENT);
+	flt->width = nsvg__coord(120.0f, NSVG_UNITS_PERCENT);
+	flt->height = nsvg__coord(120.0f, NSVG_UNITS_PERCENT);
+	flt->units = NSVG_OBJECT_SPACE;
+	flt->primitiveUnits = NSVG_USER_SPACE;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(flt->id, attr[i+1], 63);
+			flt->id[63] = '\0';
+		} else if (strcmp(attr[i], "x") == 0) {
+			flt->x = nsvg__parseCoordinateRaw(attr[i+1]);
+		} else if (strcmp(attr[i], "y") == 0) {
+			flt->y = nsvg__parseCoordinateRaw(attr[i+1]);
+		} else if (strcmp(attr[i], "width") == 0) {
+			flt->width = nsvg__parseCoordinateRaw(attr[i+1]);
+		} else if (strcmp(attr[i], "height") == 0) {
+			flt->height = nsvg__parseCoordinateRaw(attr[i+1]);
+		} else if (strcmp(attr[i], "filterUnits") == 0) {
+			if (strcmp(attr[i+1], "userSpaceOnUse") == 0)
+				flt->units = NSVG_USER_SPACE;
+			else
+				flt->units = NSVG_OBJECT_SPACE;
+		} else if (strcmp(attr[i], "primitiveUnits") == 0) {
+			if (strcmp(attr[i+1], "objectBoundingBox") == 0)
+				flt->primitiveUnits = NSVG_OBJECT_SPACE;
+			else
+				flt->primitiveUnits = NSVG_USER_SPACE;
+		}
+	}
+
+	flt->next = p->filters;
+	p->filters = flt;
+}
+
+static void nsvg__parseGaussianBlur(NSVGparser* p, const char** attr)
+{
+	int i;
+	char num[64];
+	const char* s;
+	// Add to the last filter, like gradient stops attach to the last gradient.
+	NSVGfilterData* flt = p->filters;
+	if (flt == NULL) return;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "stdDeviation") == 0) {
+			s = nsvg__parseNumber(attr[i+1], num, 64);
+			flt->stdDeviation[0] = flt->stdDeviation[1] = (float)nsvg__atof(num);
+			while (*s && (nsvg__isspace(*s) || *s == ',')) s++;
+			if (nsvg__isCoordinate(s)) {
+				nsvg__parseNumber(s, num, 64);
+				flt->stdDeviation[1] = (float)nsvg__atof(num);
+			}
+		}
+	}
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
 	if (p->defsFlag) {
-		// Skip everything but gradients and styles in defs
+		// Skip everything but gradients, filters and styles in defs
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
 		} else if (strcmp(el, "radialGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 		} else if (strcmp(el, "stop") == 0) {
 			nsvg__parseGradientStop(p, attr);
+		} else if (strcmp(el, "filter") == 0) {
+			nsvg__parseFilter(p, attr);
+		} else if (strcmp(el, "feGaussianBlur") == 0) {
+			nsvg__parseGaussianBlur(p, attr);
 		} else if (strcmp(el, "style") == 0) {
 			p->styleFlag = 1;
 		}
@@ -2890,6 +3002,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 	} else if (strcmp(el, "stop") == 0) {
 		nsvg__parseGradientStop(p, attr);
+	} else if (strcmp(el, "filter") == 0) {
+		nsvg__parseFilter(p, attr);
+	} else if (strcmp(el, "feGaussianBlur") == 0) {
+		nsvg__parseGaussianBlur(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
 	} else if (strcmp(el, "svg") == 0) {
@@ -3106,6 +3222,39 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 	sy *= us;
 	avgs = (sx+sy) / 2.0f;
 	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
+		// Resolve filter region and blur size while bounds are still in user space.
+		if (shape->filter[0] != '\0') {
+			NSVGfilterData* flt = nsvg__findFilterData(p, shape->filter);
+			if (flt == NULL) {
+				shape->filter[0] = '\0';
+			} else {
+				float bx = shape->bounds[0], by = shape->bounds[1];
+				float bw = shape->bounds[2] - bx, bh = shape->bounds[3] - by;
+				float fx, fy, fw, fh;
+				if (flt->units == NSVG_USER_SPACE) {
+					fx = nsvg__convertToPixels(p, flt->x, 0.0f, p->viewWidth);
+					fy = nsvg__convertToPixels(p, flt->y, 0.0f, p->viewHeight);
+					fw = nsvg__convertToPixels(p, flt->width, 0.0f, p->viewWidth);
+					fh = nsvg__convertToPixels(p, flt->height, 0.0f, p->viewHeight);
+				} else {
+					fx = bx + nsvg__convertToPixels(p, flt->x, 0.0f, 1.0f) * bw;
+					fy = by + nsvg__convertToPixels(p, flt->y, 0.0f, 1.0f) * bh;
+					fw = nsvg__convertToPixels(p, flt->width, 0.0f, 1.0f) * bw;
+					fh = nsvg__convertToPixels(p, flt->height, 0.0f, 1.0f) * bh;
+				}
+				shape->filterRegion[0] = (fx + tx) * sx;
+				shape->filterRegion[1] = (fy + ty) * sy;
+				shape->filterRegion[2] = fw * sx;
+				shape->filterRegion[3] = fh * sy;
+				if (flt->primitiveUnits == NSVG_OBJECT_SPACE) {
+					shape->filterStdDev[0] = flt->stdDeviation[0] * bw * sx;
+					shape->filterStdDev[1] = flt->stdDeviation[1] * bh * sy;
+				} else {
+					shape->filterStdDev[0] = flt->stdDeviation[0] * sx;
+					shape->filterStdDev[1] = flt->stdDeviation[1] * sy;
+				}
+			}
+		}
 		shape->bounds[0] = (shape->bounds[0] + tx) * sx;
 		shape->bounds[1] = (shape->bounds[1] + ty) * sy;
 		shape->bounds[2] = (shape->bounds[2] + tx) * sx;
