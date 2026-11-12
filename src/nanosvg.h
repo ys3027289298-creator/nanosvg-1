@@ -106,6 +106,18 @@ enum NSVGflags {
 	NSVG_FLAGS_VISIBLE = 0x01
 };
 
+enum NSVGpointerEvents {
+	NSVG_POINTER_EVENTS_VISIBLE_PAINTED = 0,
+	NSVG_POINTER_EVENTS_VISIBLE_FILL,
+	NSVG_POINTER_EVENTS_VISIBLE_STROKE,
+	NSVG_POINTER_EVENTS_VISIBLE,
+	NSVG_POINTER_EVENTS_PAINTED,
+	NSVG_POINTER_EVENTS_FILL,
+	NSVG_POINTER_EVENTS_STROKE,
+	NSVG_POINTER_EVENTS_ALL,
+	NSVG_POINTER_EVENTS_NONE
+};
+
 enum NSVGpaintOrder {
 	NSVG_PAINT_FILL = 0x00,
 	NSVG_PAINT_MARKERS = 0x01,
@@ -157,6 +169,7 @@ typedef struct NSVGshape
 	float miterLimit;			// Miter limit
 	char fillRule;				// Fill rule, see NSVGfillRule.
     unsigned char paintOrder;	// Encoded paint order (3×2-bit fields) see NSVGpaintOrder
+	char pointerEvents;			// Pointer events mode, see NSVGpointerEvents.
 	unsigned char flags;		// Logical or of NSVG_FLAGS_* flags
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
@@ -182,6 +195,10 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi);
 
 // Duplicates a path.
 NSVGpath* nsvgDuplicatePath(NSVGpath* p);
+
+// Returns the topmost shape hit at (x,y) honoring each shape's pointer-events
+// mode, or NULL if nothing is hit. Shapes with pointer-events="none" are skipped.
+NSVGshape* nsvgHitTest(NSVGimage* image, float x, float y);
 
 // Deletes an image.
 void nsvgDelete(NSVGimage* image);
@@ -446,6 +463,7 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char pointerEvents;
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -1006,6 +1024,7 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->fillRule = attr->fillRule;
 	shape->opacity = attr->opacity;
     shape->paintOrder = attr->paintOrder;
+	shape->pointerEvents = attr->pointerEvents;
 
 	shape->paths = p->plist;
 	p->plist = NULL;
@@ -1766,6 +1785,27 @@ static char nsvg__parseFillRule(const char* str)
 	return NSVG_FILLRULE_NONZERO;
 }
 
+static char nsvg__parsePointerEvents(const char* str)
+{
+	if (strcmp(str, "visibleFill") == 0)
+		return NSVG_POINTER_EVENTS_VISIBLE_FILL;
+	else if (strcmp(str, "visibleStroke") == 0)
+		return NSVG_POINTER_EVENTS_VISIBLE_STROKE;
+	else if (strcmp(str, "visible") == 0)
+		return NSVG_POINTER_EVENTS_VISIBLE;
+	else if (strcmp(str, "painted") == 0)
+		return NSVG_POINTER_EVENTS_PAINTED;
+	else if (strcmp(str, "fill") == 0)
+		return NSVG_POINTER_EVENTS_FILL;
+	else if (strcmp(str, "stroke") == 0)
+		return NSVG_POINTER_EVENTS_STROKE;
+	else if (strcmp(str, "all") == 0)
+		return NSVG_POINTER_EVENTS_ALL;
+	else if (strcmp(str, "none") == 0)
+		return NSVG_POINTER_EVENTS_NONE;
+	return NSVG_POINTER_EVENTS_VISIBLE_PAINTED;
+}
+
 static unsigned char nsvg__parsePaintOrder(const char* str)
 {
 	if (strcmp(str, "normal") == 0 || strcmp(str, "fill stroke markers") == 0)
@@ -1922,6 +1962,8 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
 		attr->paintOrder = nsvg__parsePaintOrder(value);
+	} else if (strcmp(name, "pointer-events") == 0) {
+		attr->pointerEvents = nsvg__parsePointerEvents(value);
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -3271,6 +3313,115 @@ void nsvgDelete(NSVGimage* image)
 		shape = snext;
 	}
 	free(image);
+}
+
+static float nsvg__distPtSeg2(float x, float y, float x0, float y0, float x1, float y1)
+{
+	float dx = x1 - x0, dy = y1 - y0;
+	float d = dx*dx + dy*dy;
+	float t = (d > 0.0f) ? ((x - x0)*dx + (y - y0)*dy) / d : 0.0f;
+	float px, py;
+	if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+	px = x0 + t*dx; py = y0 + t*dy;
+	return (x - px)*(x - px) + (y - py)*(y - py);
+}
+
+// Accumulates winding number and min stroke distance for segment (x0,y0)-(x1,y1).
+static void nsvg__hitSegment(float x, float y, float x0, float y0, float x1, float y1, int* wind, float* strokeDist2)
+{
+	float isLeft = (x1 - x0)*(y - y0) - (x - x0)*(y1 - y0);
+	float d2;
+	if (y0 <= y) {
+		if (y1 > y && isLeft > 0) (*wind)++;
+	} else {
+		if (y1 <= y && isLeft < 0) (*wind)--;
+	}
+	d2 = nsvg__distPtSeg2(x, y, x0, y0, x1, y1);
+	if (d2 < *strokeDist2) *strokeDist2 = d2;
+}
+
+static void nsvg__hitCubic(float x, float y,
+	float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3,
+	int level, int* wind, float* strokeDist2)
+{
+	float c1, c2, len2;
+	float x01, y01, x12, y12, x23, y23, x012, y012, x123, y123, x0123, y0123;
+	if (level > 10) return;
+	// Flatness test: squared distance of the control points from the chord,
+	// scaled by chord length to avoid the division.
+	c1 = (x1-x0)*(y3-y0) - (x3-x0)*(y1-y0);
+	c2 = (x2-x0)*(y3-y0) - (x3-x0)*(y2-y0);
+	len2 = (x3-x0)*(x3-x0) + (y3-y0)*(y3-y0);
+	if (c1*c1 + c2*c2 <= 0.25f*0.25f * len2 + 0.0001f) {
+		nsvg__hitSegment(x, y, x0, y0, x3, y3, wind, strokeDist2);
+		return;
+	}
+	x01 = (x0+x1)*0.5f; y01 = (y0+y1)*0.5f;
+	x12 = (x1+x2)*0.5f; y12 = (y1+y2)*0.5f;
+	x23 = (x2+x3)*0.5f; y23 = (y2+y3)*0.5f;
+	x012 = (x01+x12)*0.5f; y012 = (y01+y12)*0.5f;
+	x123 = (x12+x23)*0.5f; y123 = (y12+y23)*0.5f;
+	x0123 = (x012+x123)*0.5f; y0123 = (y012+y123)*0.5f;
+	nsvg__hitCubic(x, y, x0, y0, x01, y01, x012, y012, x0123, y0123, level+1, wind, strokeDist2);
+	nsvg__hitCubic(x, y, x0123, y0123, x123, y123, x23, y23, x3, y3, level+1, wind, strokeDist2);
+}
+
+static int nsvg__shapeHit(NSVGshape* shape, float x, float y)
+{
+	int wind = 0, inFill, inStroke, paintedFill, paintedStroke, visible;
+	float strokeDist2 = 1e30f, halfWidth;
+	NSVGpath* path;
+	int i;
+
+	if (shape->pointerEvents == NSVG_POINTER_EVENTS_NONE)
+		return 0;
+
+	for (path = shape->paths; path != NULL; path = path->next) {
+		for (i = 0; i < path->npts-1; i += 3) {
+			float* p = &path->pts[i*2];
+			nsvg__hitCubic(x, y, p[0],p[1], p[2],p[3], p[4],p[5], p[6],p[7], 0, &wind, &strokeDist2);
+		}
+		if (path->closed && path->npts > 1) {
+			float* first = &path->pts[0];
+			float* last = &path->pts[(path->npts-1)*2];
+			nsvg__hitSegment(x, y, last[0], last[1], first[0], first[1], &wind, &strokeDist2);
+		}
+	}
+
+	inFill = (shape->fillRule == NSVG_FILLRULE_EVENODD) ? (wind & 1) : (wind != 0);
+	halfWidth = shape->strokeWidth * 0.5f;
+	inStroke = strokeDist2 <= halfWidth*halfWidth;
+	visible = (shape->flags & NSVG_FLAGS_VISIBLE) != 0;
+	paintedFill = shape->fill.type != NSVG_PAINT_NONE &&
+		(shape->fill.type != NSVG_PAINT_COLOR || ((shape->fill.color >> 24) & 0xff) != 0);
+	paintedStroke = shape->stroke.type != NSVG_PAINT_NONE &&
+		(shape->stroke.type != NSVG_PAINT_COLOR || ((shape->stroke.color >> 24) & 0xff) != 0);
+
+	switch (shape->pointerEvents) {
+		case NSVG_POINTER_EVENTS_VISIBLE_FILL: return visible && inFill;
+		case NSVG_POINTER_EVENTS_VISIBLE_STROKE: return visible && inStroke;
+		case NSVG_POINTER_EVENTS_VISIBLE: return visible && (inFill || inStroke);
+		case NSVG_POINTER_EVENTS_PAINTED: return (paintedFill && inFill) || (paintedStroke && inStroke);
+		case NSVG_POINTER_EVENTS_FILL: return inFill;
+		case NSVG_POINTER_EVENTS_STROKE: return inStroke;
+		case NSVG_POINTER_EVENTS_ALL: return inFill || inStroke;
+		case NSVG_POINTER_EVENTS_VISIBLE_PAINTED:
+		default:
+			return visible && ((paintedFill && inFill) || (paintedStroke && inStroke));
+	}
+}
+
+NSVGshape* nsvgHitTest(NSVGimage* image, float x, float y)
+{
+	NSVGshape* shape;
+	NSVGshape* hit = NULL;
+	if (image == NULL) return NULL;
+	// Shapes are in document order, so the last hit is the topmost one.
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		if (nsvg__shapeHit(shape, x, y))
+			hit = shape;
+	}
+	return hit;
 }
 
 #endif // NANOSVG_IMPLEMENTATION
