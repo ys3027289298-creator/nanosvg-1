@@ -1372,6 +1372,83 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+static NSVGfilter* nsvg__findFilter(NSVGimage* image, const char* id)
+{
+	NSVGfilter* filter = image->filters;
+	while (filter != NULL) {
+		if (strcmp(filter->id, id) == 0)
+			return filter;
+		filter = filter->next;
+	}
+	return NULL;
+}
+
+static unsigned int nsvg__noiseHash(int x, int y, unsigned int seed)
+{
+	unsigned int h = seed ^ 0x9e3779b9u;
+	h ^= (unsigned int)x * 0x85ebca6bu;
+	h = (h >> 13) | (h << 19);
+	h ^= (unsigned int)y * 0xc2b2ae35u;
+	h *= 0x27d4eb2du;
+	h ^= h >> 15;
+	return h;
+}
+
+static float nsvg__turbulenceNoise(NSVGturbulence* turb, float x, float y, int channel)
+{
+	float fx = turb->baseFrequency[0] > 0.0f ? turb->baseFrequency[0] : 1.0f;
+	float fy = turb->baseFrequency[1] > 0.0f ? turb->baseFrequency[1] : 1.0f;
+	unsigned int seed = (unsigned int)(turb->seed * 256.0f) + (unsigned int)channel * 0x632be5abu;
+	float sum = 0.0f, amp = 1.0f, norm = 0.0f, freq = 1.0f;
+	int oct;
+	for (oct = 0; oct < turb->numOctaves; oct++) {
+		float px = x * fx * freq, py = y * fy * freq;
+		int ix = (int)floorf(px), iy = (int)floorf(py);
+		float tx = px - (float)ix, ty = py - (float)iy;
+		unsigned int s = seed + (unsigned int)oct * 0x1f123bb5u;
+		float v00 = (float)(nsvg__noiseHash(ix, iy, s) & 0xffff) / 65535.0f;
+		float v10 = (float)(nsvg__noiseHash(ix + 1, iy, s) & 0xffff) / 65535.0f;
+		float v01 = (float)(nsvg__noiseHash(ix, iy + 1, s) & 0xffff) / 65535.0f;
+		float v11 = (float)(nsvg__noiseHash(ix + 1, iy + 1, s) & 0xffff) / 65535.0f;
+		float n = (v00 * (1.0f - tx) + v10 * tx) * (1.0f - ty) + (v01 * (1.0f - tx) + v11 * tx) * ty;
+		if (turb->type == 0)
+			n = fabsf(2.0f * n - 1.0f);
+		sum += n * amp;
+		norm += amp;
+		amp *= 0.5f;
+		freq *= 2.0f;
+	}
+	return norm > 0.0f ? sum / norm : 0.0f;
+}
+
+static void nsvg__applyTurbulence(unsigned char* dst, int w, int h, int stride, NSVGturbulence* turb, float* bounds)
+{
+	// Convert the kernel unit length to a pixel step, deriving it from stdDeviation if not set.
+	float stepX = turb->kernelUnitLength[0];
+	float stepY = turb->kernelUnitLength[1];
+	int x0, y0, x1, y1, x, y, c, nchan;
+	if (stepX <= 0.0f) stepX = turb->stdDeviation[0] > 0.0f ? turb->stdDeviation[0] * 2.0f : 1.0f;
+	if (stepY <= 0.0f) stepY = turb->stdDeviation[1] > 0.0f ? turb->stdDeviation[1] * 2.0f : 1.0f;
+	// With the units resolved, decide whether the alpha channel is preserved.
+	nchan = turb->preserveAlpha ? 3 : 4;
+	x0 = (int)floorf(bounds[0]) - 1; if (x0 < 0) x0 = 0;
+	y0 = (int)floorf(bounds[1]) - 1; if (y0 < 0) y0 = 0;
+	x1 = (int)ceilf(bounds[2]) + 1; if (x1 > w) x1 = w;
+	y1 = (int)ceilf(bounds[3]) + 1; if (y1 > h) y1 = h;
+	for (y = y0; y < y1; y++) {
+		unsigned char* row = &dst[y * stride];
+		for (x = x0; x < x1; x++) {
+			float nx = (float)x / stepX;
+			float ny = (float)y / stepY;
+			for (c = 0; c < nchan; c++) {
+				float n = nsvg__turbulenceNoise(turb, nx, ny, c);
+				int v = row[x * 4 + c] + (int)((n - 0.5f) * 255.0f);
+				row[x * 4 + c] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+			}
+		}
+	}
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
@@ -1460,6 +1537,27 @@ void nsvgRasterize(NSVGrasterizer* r,
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);
+
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		NSVGfilter* filter;
+		NSVGturbulence turb;
+		float bounds[4];
+		if (!(shape->flags & NSVG_FLAGS_VISIBLE) || shape->filter[0] == '\0')
+			continue;
+		filter = nsvg__findFilter(image, shape->filter);
+		if (filter == NULL || !filter->hasTurbulence)
+			continue;
+		turb = filter->turbulence;
+		turb.kernelUnitLength[0] *= scale;
+		turb.kernelUnitLength[1] *= scale;
+		turb.stdDeviation[0] *= scale;
+		turb.stdDeviation[1] *= scale;
+		bounds[0] = tx + shape->bounds[0] * scale;
+		bounds[1] = ty + shape->bounds[1] * scale;
+		bounds[2] = tx + shape->bounds[2] * scale;
+		bounds[3] = ty + shape->bounds[3] * scale;
+		nsvg__applyTurbulence(dst, w, h, stride, &turb, bounds);
+	}
 
 	r->bitmap = NULL;
 	r->width = 0;

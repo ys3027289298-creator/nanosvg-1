@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <filter id="grain">
+      <feTurbulence type="turbulence" baseFrequency="0.9" numOctaves="3" seed="3" kernelUnitLength="4" preserveAlpha="true"/>
+    </filter>
+  </defs>
+  <rect x="32" y="32" width="64" height="64" fill="#3366cc" filter="url(#grain)"/>
+</svg>
