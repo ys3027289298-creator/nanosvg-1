@@ -103,7 +103,8 @@ enum NSVGfillRule {
 };
 
 enum NSVGflags {
-	NSVG_FLAGS_VISIBLE = 0x01
+	NSVG_FLAGS_VISIBLE = 0x01,
+	NSVG_FLAGS_DROP_SHADOW = 0x02
 };
 
 enum NSVGpaintOrder {
@@ -162,6 +163,11 @@ typedef struct NSVGshape
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
 	float xform[6];				// Root transformation for fill/stroke gradient
+	char filter[64];			// Optional 'id' of filter
+	float shadowDx;				// feDropShadow offset x (px).
+	float shadowDy;				// feDropShadow offset y (px).
+	float shadowStdDev;			// feDropShadow blur stdDeviation (px).
+	unsigned int shadowColor;	// feDropShadow flood-color, flood-opacity baked into alpha.
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
 } NSVGshape;
@@ -446,6 +452,7 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char filter[64];
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -454,6 +461,17 @@ typedef struct NSVGstyleDeclaration
 	char* propertiesText;
 	struct NSVGstyleDeclaration* next;
 } NSVGstyleDeclaration;
+
+typedef struct NSVGfilterData
+{
+	char id[64];
+	char hasDropShadow;
+	float dx, dy;
+	float stdDeviation;
+	unsigned int floodColor;
+	float floodOpacity;
+	struct NSVGfilterData* next;
+} NSVGfilterData;
 
 typedef struct NSVGparser
 {
@@ -466,6 +484,7 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGfilterData* filters;
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -473,6 +492,7 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	char filterFlag;
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -712,12 +732,23 @@ static void nsvg__deleteGradientData(NSVGgradientData* grad)
 	}
 }
 
+static void nsvg__deleteFilterData(NSVGfilterData* filter)
+{
+	NSVGfilterData* next;
+	while (filter != NULL) {
+		next = filter->next;
+		free(filter);
+		filter = next;
+	}
+}
+
 static void nsvg__deleteParser(NSVGparser* p)
 {
 	if (p != NULL) {
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		nsvg__deleteFilterData(p->filters);
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -993,6 +1024,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->filter, attr->filter, sizeof shape->filter);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1922,6 +1954,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
 		attr->paintOrder = nsvg__parsePaintOrder(value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filter, value);
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -2721,6 +2756,63 @@ static void nsvg__parseSVG(NSVGparser* p, const char** attr)
 	}
 }
 
+static NSVGfilterData* nsvg__findFilterData(NSVGparser* p, const char* id)
+{
+	NSVGfilterData* filter = p->filters;
+	while (filter) {
+		if (strcmp(filter->id, id) == 0)
+			return filter;
+		filter = filter->next;
+	}
+	return filter;
+}
+
+static void nsvg__parseFilter(NSVGparser* p, const char** attr)
+{
+	int i;
+	NSVGfilterData* filter = (NSVGfilterData*)malloc(sizeof(NSVGfilterData));
+	if (filter == NULL) return;
+	memset(filter, 0, sizeof(NSVGfilterData));
+	filter->floodOpacity = 1.0f;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(filter->id, attr[i+1], 63);
+			filter->id[63] = '\0';
+		}
+	}
+
+	filter->next = p->filters;
+	p->filters = filter;
+	p->filterFlag = 1;
+}
+
+static void nsvg__parseDropShadow(NSVGparser* p, const char** attr)
+{
+	NSVGfilterData* filter;
+	int i;
+
+	if (!p->filterFlag) return;
+	// Add drop shadow to the last filter.
+	filter = p->filters;
+	if (filter == NULL) return;
+
+	filter->hasDropShadow = 1;
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "dx") == 0) {
+			filter->dx = nsvg__parseCoordinate(p, attr[i+1], 0.0f, nsvg__actualLength(p));
+		} else if (strcmp(attr[i], "dy") == 0) {
+			filter->dy = nsvg__parseCoordinate(p, attr[i+1], 0.0f, nsvg__actualLength(p));
+		} else if (strcmp(attr[i], "stdDeviation") == 0) {
+			filter->stdDeviation = fabsf(nsvg__parseCoordinate(p, attr[i+1], 0.0f, nsvg__actualLength(p)));
+		} else if (strcmp(attr[i], "flood-color") == 0) {
+			filter->floodColor = nsvg__parseColor(attr[i+1]);
+		} else if (strcmp(attr[i], "flood-opacity") == 0) {
+			filter->floodOpacity = nsvg__parseOpacity(attr[i+1]);
+		}
+	}
+}
+
 static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char type)
 {
 	int i;
@@ -2845,6 +2937,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 			nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 		} else if (strcmp(el, "stop") == 0) {
 			nsvg__parseGradientStop(p, attr);
+		} else if (strcmp(el, "filter") == 0) {
+			nsvg__parseFilter(p, attr);
+		} else if (strcmp(el, "feDropShadow") == 0) {
+			nsvg__parseDropShadow(p, attr);
 		} else if (strcmp(el, "style") == 0) {
 			p->styleFlag = 1;
 		}
@@ -2890,6 +2986,10 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 	} else if (strcmp(el, "stop") == 0) {
 		nsvg__parseGradientStop(p, attr);
+	} else if (strcmp(el, "filter") == 0) {
+		nsvg__parseFilter(p, attr);
+	} else if (strcmp(el, "feDropShadow") == 0) {
+		nsvg__parseDropShadow(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
 	} else if (strcmp(el, "svg") == 0) {
@@ -2909,6 +3009,8 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->pathFlag = 0;
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 0;
+	} else if (strcmp(el, "filter") == 0) {
+		p->filterFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
 	}
@@ -3137,6 +3239,10 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		shape->strokeDashOffset *= avgs;
 		for (i = 0; i < shape->strokeDashCount; i++)
 			shape->strokeDashArray[i] *= avgs;
+
+		shape->shadowDx *= sx;
+		shape->shadowDy *= sy;
+		shape->shadowStdDev *= avgs;
 	}
 }
 
@@ -3170,6 +3276,25 @@ static void nsvg__createGradients(NSVGparser* p)
 	}
 }
 
+static void nsvg__resolveFilters(NSVGparser* p)
+{
+	NSVGshape* shape;
+	NSVGfilterData* filter;
+
+	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
+		if (shape->filter[0] == '\0')
+			continue;
+		filter = nsvg__findFilterData(p, shape->filter);
+		if (filter == NULL || !filter->hasDropShadow)
+			continue;
+		shape->flags |= NSVG_FLAGS_DROP_SHADOW;
+		shape->shadowDx = filter->dx;
+		shape->shadowDy = filter->dy;
+		shape->shadowStdDev = filter->stdDeviation;
+		shape->shadowColor = filter->floodColor | ((unsigned int)(filter->floodOpacity*255) << 24);
+	}
+}
+
 NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 {
 	NSVGparser* p;
@@ -3185,6 +3310,9 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 
 	// Create gradients after all definitions have been parsed
 	nsvg__createGradients(p);
+
+	// Resolve filters after all definitions have been parsed
+	nsvg__resolveFilters(p);
 
 	// Scale to viewBox
 	nsvg__scaleToViewbox(p, units);
