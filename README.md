@@ -32,6 +32,13 @@ The parser library is accompanied with really simpler SVG rasterizer. Currently 
 
 The intended usage for the rasterizer is to for example bake icons of different size into a texture. The rasterizer is not particular fast or accurate, but it's small and packed in one header file.
 
+The rasterizer applies `<mask>` elements referenced through the `mask` property. The `mask-type` property selects how the mask occlusion coefficient is computed:
+
+- `luminance` (default when `mask-type` is absent): weighted RGB luma using the Rec. 709 coefficients `0.2126 R + 0.7152 G + 0.0722 B`, multiplied by the mask alpha.
+- `alpha`: the mask alpha alone.
+
+Shapes without a mask are rendered exactly as before. A staged test covering grayscale, alpha, colored masks and a no-mask regression lives in `tests/mask_type_test.c` and can be run with `tests/run_mask_type_test.sh`.
+
 
 ## Example Usage
 

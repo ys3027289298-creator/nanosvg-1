@@ -112,6 +112,11 @@ enum NSVGpaintOrder {
 	NSVG_PAINT_STROKE = 0x02,
 };
 
+enum NSVGmaskType {
+	NSVG_MASK_LUMINANCE = 0,
+	NSVG_MASK_ALPHA = 1
+};
+
 typedef struct NSVGgradientStop {
 	unsigned int color;
 	float offset;
@@ -161,16 +166,27 @@ typedef struct NSVGshape
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	char mask[64];				// Optional 'id' of mask, empty if no mask
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
 } NSVGshape;
+
+typedef struct NSVGmaskData
+{
+	char id[64];
+	char maskType;				// NSVG_MASK_LUMINANCE or NSVG_MASK_ALPHA
+	NSVGshape* shapes;			// Linked list of shapes making up the mask
+	NSVGshape* shapesTail;
+	struct NSVGmaskData* next;
+} NSVGmaskData;
 
 typedef struct NSVGimage
 {
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGmaskData* masks;		// Linked list of mask definitions in the image.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -446,6 +462,8 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char mask[64];				// Optional 'id' referenced by 'mask' property, empty if none
+	char maskType;				// 'mask-type' property, NSVG_MASK_LUMINANCE by default
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -466,6 +484,7 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGmaskData* masks;
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -473,6 +492,8 @@ typedef struct NSVGparser
 	char pathFlag;
 	char defsFlag;
 	char styleFlag;
+	char maskFlag;				// Inside a <mask> element, its shapes go to the mask data
+	NSVGmaskData* curMask;		// Mask currently being parsed
 } NSVGparser;
 
 static void nsvg__xformIdentity(float* t)
@@ -664,6 +685,8 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
+	p->attr[0].mask[0] = '\0';
+	p->attr[0].maskType = NSVG_MASK_LUMINANCE;
 
 	return p;
 
@@ -712,12 +735,32 @@ static void nsvg__deleteGradientData(NSVGgradientData* grad)
 	}
 }
 
+static void nsvg__deleteMaskData(NSVGmaskData* mask)
+{
+	NSVGmaskData* next;
+	while (mask != NULL) {
+		NSVGshape* shape = mask->shapes;
+		next = mask->next;
+		while (shape != NULL) {
+			NSVGshape* snext = shape->next;
+			nsvg__deletePaths(shape->paths);
+			nsvg__deletePaint(&shape->fill);
+			nsvg__deletePaint(&shape->stroke);
+			free(shape);
+			shape = snext;
+		}
+		free(mask);
+		mask = next;
+	}
+}
+
 static void nsvg__deleteParser(NSVGparser* p)
 {
 	if (p != NULL) {
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		nsvg__deleteMaskData(p->masks);
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -993,6 +1036,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->mask, attr->mask, sizeof shape->mask);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1048,11 +1092,20 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->flags = (attr->visible ? NSVG_FLAGS_VISIBLE : 0x00);
 
 	// Add to tail
-	if (p->image->shapes == NULL)
-		p->image->shapes = shape;
-	else
-		p->shapesTail->next = shape;
-	p->shapesTail = shape;
+	if (p->maskFlag && p->curMask != NULL) {
+		// Shape belongs to a mask definition, keep it out of the main image.
+		if (p->curMask->shapes == NULL)
+			p->curMask->shapes = shape;
+		else
+			p->curMask->shapesTail->next = shape;
+		p->curMask->shapesTail = shape;
+	} else {
+		if (p->image->shapes == NULL)
+			p->image->shapes = shape;
+		else
+			p->shapesTail->next = shape;
+		p->shapesTail = shape;
+	}
 
 	return;
 
@@ -1927,6 +1980,14 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->id[63] = '\0';
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
+	} else if (strcmp(name, "mask") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->mask, value);
+	} else if (strcmp(name, "mask-type") == 0 || strcmp(name, "maskType") == 0) {
+		if (strcmp(value, "alpha") == 0)
+			attr->maskType = NSVG_MASK_ALPHA;
+		else
+			attr->maskType = NSVG_MASK_LUMINANCE;
 	}
 	else {
 		return 0;
@@ -2833,18 +2894,61 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseMask(NSVGparser* p, const char** attr)
+{
+	int i;
+	NSVGmaskData* mask = (NSVGmaskData*)malloc(sizeof(NSVGmaskData));
+	if (mask == NULL) return;
+	memset(mask, 0, sizeof(NSVGmaskData));
+	// Per the SVG spec, mask-type defaults to luminance.
+	mask->maskType = NSVG_MASK_LUMINANCE;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(mask->id, attr[i+1], 63);
+			mask->id[63] = '\0';
+		} else if (strcmp(attr[i], "mask-type") == 0 ||
+				   strcmp(attr[i], "maskType") == 0) {
+			if (strcmp(attr[i+1], "alpha") == 0)
+				mask->maskType = NSVG_MASK_ALPHA;
+		} else if (strcmp(attr[i], "style") == 0) {
+			// Parse locally to avoid mutating the surrounding paint context;
+			// only mask-type is relevant on the mask element itself.
+			const char* s = attr[i+1];
+			while (*s) {
+				while (*s && nsvg__isspace(*s)) s++;
+				if (strncmp(s, "mask-type", 9) == 0) {
+					const char* v = s + 9;
+					while (*v && (nsvg__isspace(*v) || *v == ':')) v++;
+					if (strncmp(v, "alpha", 5) == 0)
+						mask->maskType = NSVG_MASK_ALPHA;
+				}
+				while (*s && *s != ';') s++;
+				if (*s) s++;
+			}
+		}
+	}
+
+	mask->next = p->masks;
+	p->masks = mask;
+	p->curMask = mask;
+	p->maskFlag = 1;
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
-	if (p->defsFlag) {
-		// Skip everything but gradients and styles in defs
+	if (p->defsFlag && !p->maskFlag) {
+		// Skip everything but gradients, masks and styles in defs
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
 		} else if (strcmp(el, "radialGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 		} else if (strcmp(el, "stop") == 0) {
 			nsvg__parseGradientStop(p, attr);
+		} else if (strcmp(el, "mask") == 0) {
+			nsvg__parseMask(p, attr);
 		} else if (strcmp(el, "style") == 0) {
 			p->styleFlag = 1;
 		}
@@ -2890,6 +2994,8 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 	} else if (strcmp(el, "stop") == 0) {
 		nsvg__parseGradientStop(p, attr);
+	} else if (strcmp(el, "mask") == 0) {
+		nsvg__parseMask(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
 	} else if (strcmp(el, "svg") == 0) {
@@ -2903,7 +3009,10 @@ static void nsvg__endElement(void* ud, const char* el)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
-	if (strcmp(el, "g") == 0) {
+	if (strcmp(el, "mask") == 0) {
+		p->maskFlag = 0;
+		p->curMask = NULL;
+	} else if (strcmp(el, "g") == 0) {
 		nsvg__popAttr(p);
 	} else if (strcmp(el, "path") == 0) {
 		p->pathFlag = 0;
@@ -3049,13 +3158,51 @@ static void nsvg__scaleGradient(NSVGgradient* grad, float tx, float ty, float sx
 	nsvg__xformMultiply (grad->xform, t);
 }
 
+static void nsvg__scaleShape(NSVGshape* shape, float tx, float ty, float sx, float sy, float avgs)
+{
+	NSVGpath* path;
+	float t[6];
+	int i;
+	float* pt;
+
+	shape->bounds[0] = (shape->bounds[0] + tx) * sx;
+	shape->bounds[1] = (shape->bounds[1] + ty) * sy;
+	shape->bounds[2] = (shape->bounds[2] + tx) * sx;
+	shape->bounds[3] = (shape->bounds[3] + ty) * sy;
+	for (path = shape->paths; path != NULL; path = path->next) {
+		path->bounds[0] = (path->bounds[0] + tx) * sx;
+		path->bounds[1] = (path->bounds[1] + ty) * sy;
+		path->bounds[2] = (path->bounds[2] + tx) * sx;
+		path->bounds[3] = (path->bounds[3] + ty) * sy;
+		for (i =0; i < path->npts; i++) {
+			pt = &path->pts[i*2];
+			pt[0] = (pt[0] + tx) * sx;
+			pt[1] = (pt[1] + ty) * sy;
+		}
+	}
+
+	if (shape->fill.type == NSVG_PAINT_LINEAR_GRADIENT || shape->fill.type == NSVG_PAINT_RADIAL_GRADIENT) {
+		nsvg__scaleGradient(shape->fill.gradient, tx,ty, sx,sy);
+		memcpy(t, shape->fill.gradient->xform, sizeof(float)*6);
+		nsvg__xformInverse(shape->fill.gradient->xform, t);
+	}
+	if (shape->stroke.type == NSVG_PAINT_LINEAR_GRADIENT || shape->stroke.type == NSVG_PAINT_RADIAL_GRADIENT) {
+		nsvg__scaleGradient(shape->stroke.gradient, tx,ty, sx,sy);
+		memcpy(t, shape->stroke.gradient->xform, sizeof(float)*6);
+		nsvg__xformInverse(shape->stroke.gradient->xform, t);
+	}
+
+	shape->strokeWidth *= avgs;
+	shape->strokeDashOffset *= avgs;
+	for (i = 0; i < shape->strokeDashCount; i++)
+		shape->strokeDashArray[i] *= avgs;
+}
+
 static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 {
 	NSVGshape* shape;
-	NSVGpath* path;
-	float tx, ty, sx, sy, us, bounds[4], t[6], avgs;
-	int i;
-	float* pt;
+	float tx, ty, sx, sy, us, bounds[4], avgs;
+	NSVGmaskData* mask;
 
 	// Guess image size if not set completely.
 	nsvg__imageBounds(p, bounds);
@@ -3106,67 +3253,54 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 	sy *= us;
 	avgs = (sx+sy) / 2.0f;
 	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
-		shape->bounds[0] = (shape->bounds[0] + tx) * sx;
-		shape->bounds[1] = (shape->bounds[1] + ty) * sy;
-		shape->bounds[2] = (shape->bounds[2] + tx) * sx;
-		shape->bounds[3] = (shape->bounds[3] + ty) * sy;
-		for (path = shape->paths; path != NULL; path = path->next) {
-			path->bounds[0] = (path->bounds[0] + tx) * sx;
-			path->bounds[1] = (path->bounds[1] + ty) * sy;
-			path->bounds[2] = (path->bounds[2] + tx) * sx;
-			path->bounds[3] = (path->bounds[3] + ty) * sy;
-			for (i =0; i < path->npts; i++) {
-				pt = &path->pts[i*2];
-				pt[0] = (pt[0] + tx) * sx;
-				pt[1] = (pt[1] + ty) * sy;
-			}
-		}
+		nsvg__scaleShape(shape, tx, ty, sx, sy, avgs);
+	}
 
-		if (shape->fill.type == NSVG_PAINT_LINEAR_GRADIENT || shape->fill.type == NSVG_PAINT_RADIAL_GRADIENT) {
-			nsvg__scaleGradient(shape->fill.gradient, tx,ty, sx,sy);
-			memcpy(t, shape->fill.gradient->xform, sizeof(float)*6);
-			nsvg__xformInverse(shape->fill.gradient->xform, t);
-		}
-		if (shape->stroke.type == NSVG_PAINT_LINEAR_GRADIENT || shape->stroke.type == NSVG_PAINT_RADIAL_GRADIENT) {
-			nsvg__scaleGradient(shape->stroke.gradient, tx,ty, sx,sy);
-			memcpy(t, shape->stroke.gradient->xform, sizeof(float)*6);
-			nsvg__xformInverse(shape->stroke.gradient->xform, t);
-		}
+	// Mask content lives in the same user space and is scaled identically.
+	for (mask = p->masks; mask != NULL; mask = mask->next) {
+		for (shape = mask->shapes; shape != NULL; shape = shape->next)
+			nsvg__scaleShape(shape, tx, ty, sx, sy, avgs);
+	}
+}
 
-		shape->strokeWidth *= avgs;
-		shape->strokeDashOffset *= avgs;
-		for (i = 0; i < shape->strokeDashCount; i++)
-			shape->strokeDashArray[i] *= avgs;
+static void nsvg__resolveShapeGradients(NSVGparser* p, NSVGshape* shape)
+{
+	if (shape->fill.type == NSVG_PAINT_UNDEF) {
+		if (shape->fillGradient[0] != '\0') {
+			float inv[6], localBounds[4];
+			nsvg__xformInverse(inv, shape->xform);
+			nsvg__getLocalBounds(localBounds, shape, inv);
+			shape->fill.gradient = nsvg__createGradient(p, shape->fillGradient, localBounds, shape->xform, &shape->fill.type);
+		}
+		if (shape->fill.type == NSVG_PAINT_UNDEF) {
+			shape->fill.type = NSVG_PAINT_NONE;
+		}
+	}
+	if (shape->stroke.type == NSVG_PAINT_UNDEF) {
+		if (shape->strokeGradient[0] != '\0') {
+			float inv[6], localBounds[4];
+			nsvg__xformInverse(inv, shape->xform);
+			nsvg__getLocalBounds(localBounds, shape, inv);
+			shape->stroke.gradient = nsvg__createGradient(p, shape->strokeGradient, localBounds, shape->xform, &shape->stroke.type);
+		}
+		if (shape->stroke.type == NSVG_PAINT_UNDEF) {
+			shape->stroke.type = NSVG_PAINT_NONE;
+		}
 	}
 }
 
 static void nsvg__createGradients(NSVGparser* p)
 {
 	NSVGshape* shape;
+	NSVGmaskData* mask;
 
 	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
-		if (shape->fill.type == NSVG_PAINT_UNDEF) {
-			if (shape->fillGradient[0] != '\0') {
-				float inv[6], localBounds[4];
-				nsvg__xformInverse(inv, shape->xform);
-				nsvg__getLocalBounds(localBounds, shape, inv);
-				shape->fill.gradient = nsvg__createGradient(p, shape->fillGradient, localBounds, shape->xform, &shape->fill.type);
-			}
-			if (shape->fill.type == NSVG_PAINT_UNDEF) {
-				shape->fill.type = NSVG_PAINT_NONE;
-			}
-		}
-		if (shape->stroke.type == NSVG_PAINT_UNDEF) {
-			if (shape->strokeGradient[0] != '\0') {
-				float inv[6], localBounds[4];
-				nsvg__xformInverse(inv, shape->xform);
-				nsvg__getLocalBounds(localBounds, shape, inv);
-				shape->stroke.gradient = nsvg__createGradient(p, shape->strokeGradient, localBounds, shape->xform, &shape->stroke.type);
-			}
-			if (shape->stroke.type == NSVG_PAINT_UNDEF) {
-				shape->stroke.type = NSVG_PAINT_NONE;
-			}
-		}
+		nsvg__resolveShapeGradients(p, shape);
+	}
+
+	for (mask = p->masks; mask != NULL; mask = mask->next) {
+		for (shape = mask->shapes; shape != NULL; shape = shape->next)
+			nsvg__resolveShapeGradients(p, shape);
 	}
 }
 
@@ -3191,6 +3325,9 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 
 	ret = p->image;
 	p->image = NULL;
+	// Transfer mask definitions to the image, the parser no longer owns them.
+	ret->masks = p->masks;
+	p->masks = NULL;
 
 	nsvg__deleteParser(p);
 
@@ -3270,6 +3407,7 @@ void nsvgDelete(NSVGimage* image)
 		free(shape);
 		shape = snext;
 	}
+	nsvg__deleteMaskData(image->masks);
 	free(image);
 }
 
