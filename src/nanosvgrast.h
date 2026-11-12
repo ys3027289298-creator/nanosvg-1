@@ -1372,34 +1372,96 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
-void nsvgRasterize(NSVGrasterizer* r,
-				   NSVGimage* image, float tx, float ty, float scale,
-				   unsigned char* dst, int w, int h, int stride)
+static NSVGfilter* nsvg__findFilter(NSVGimage* image, const char* id)
 {
-	NSVGshape *shape = NULL;
+	NSVGfilter* filter = image->filters;
+	while (filter != NULL) {
+		if (strcmp(filter->id, id) == 0)
+			return filter;
+		filter = filter->next;
+	}
+	return NULL;
+}
+
+// Returns a pixel buffer for a named filter input. "SourceGraphic" (or "")
+// shares the source buffer, anything else is newly allocated and sets owned.
+static unsigned char* nsvg__filterInput(NSVGrasterizer* r, NSVGfilter* filter, const char* name, unsigned char* src, int* owned)
+{
+	int i, n = r->height * r->stride;
+	unsigned char* buf;
+	*owned = 0;
+	if (name[0] == '\0' || strcmp(name, "SourceGraphic") == 0)
+		return src;
+	buf = (unsigned char*)malloc(n);
+	if (buf == NULL) return src;
+	*owned = 1;
+	if (strcmp(name, "SourceAlpha") == 0) {
+		for (i = 0; i < n; i += 4) {
+			buf[i+0] = 0; buf[i+1] = 0; buf[i+2] = 0;
+			buf[i+3] = src[i+3];
+		}
+	} else if (filter->hasFlood && strcmp(name, filter->floodResult) == 0) {
+		for (i = 0; i < n; i += 4) {
+			buf[i+0] = (unsigned char)(filter->floodColor & 0xff);
+			buf[i+1] = (unsigned char)((filter->floodColor >> 8) & 0xff);
+			buf[i+2] = (unsigned char)((filter->floodColor >> 16) & 0xff);
+			buf[i+3] = (unsigned char)((filter->floodColor >> 24) & 0xff);
+		}
+	} else {
+		memset(buf, 0, n); // Unknown input: treat as transparent black.
+	}
+	return buf;
+}
+
+// Applies feDisplacementMap: output(x,y) = input(x + dx, y + dy), where
+// dx/dy are the in2 map channel values remapped to [-0.5,0.5] times scale.
+// Samples outside the image are treated as transparent.
+static void nsvg__applyDisplacementMap(NSVGrasterizer* r, NSVGfilter* filter, unsigned char* src, float scale)
+{
+	int w = r->width, h = r->height, stride = r->stride;
+	unsigned char* dst = r->bitmap;
+	unsigned char* map;
+	unsigned char* in;
+	int mapOwned, inOwned;
+	int x, y;
+	int xc = filter->xChannelSelector;
+	int yc = filter->yChannelSelector;
+	float fscale = filter->scale * scale;
+
+	map = nsvg__filterInput(r, filter, filter->in2, src, &mapOwned);
+	in = nsvg__filterInput(r, filter, filter->in, src, &inOwned);
+
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			unsigned char* mp = &map[y*stride + x*4];
+			float dx = (mp[xc] / 255.0f - 0.5f) * fscale;
+			float dy = (mp[yc] / 255.0f - 0.5f) * fscale;
+			int sx = (int)floorf(x + dx + 0.5f);
+			int sy = (int)floorf(y + dy + 0.5f);
+			unsigned char* d = &dst[y*stride + x*4];
+			unsigned char s[4] = {0,0,0,0};
+			int ia;
+			if (sx >= 0 && sx < w && sy >= 0 && sy < h)
+				memcpy(s, &in[sy*stride + sx*4], 4);
+			ia = 255 - s[3];
+			d[0] = (unsigned char)(s[0] + nsvg__div255(ia * (int)d[0]));
+			d[1] = (unsigned char)(s[1] + nsvg__div255(ia * (int)d[1]));
+			d[2] = (unsigned char)(s[2] + nsvg__div255(ia * (int)d[2]));
+			d[3] = (unsigned char)(s[3] + nsvg__div255(ia * (int)d[3]));
+		}
+	}
+
+	if (mapOwned) free(map);
+	if (inOwned) free(in);
+}
+
+static void nsvg__renderShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale)
+{
 	NSVGedge *e = NULL;
 	NSVGcachedPaint cache;
 	int i;
     int j;
     unsigned char paintOrder;
-
-	r->bitmap = dst;
-	r->width = w;
-	r->height = h;
-	r->stride = stride;
-
-	if (w > r->cscanline) {
-		r->cscanline = w;
-		r->scanline = (unsigned char*)realloc(r->scanline, w);
-		if (r->scanline == NULL) return;
-	}
-
-	for (i = 0; i < h; i++)
-		memset(&dst[i*stride], 0, w*4);
-
-	for (shape = image->shapes; shape != NULL; shape = shape->next) {
-		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
-			continue;
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1457,6 +1519,50 @@ void nsvgRasterize(NSVGrasterizer* r,
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
         }
+}
+
+void nsvgRasterize(NSVGrasterizer* r,
+				   NSVGimage* image, float tx, float ty, float scale,
+				   unsigned char* dst, int w, int h, int stride)
+{
+	NSVGshape *shape = NULL;
+	int i;
+
+	r->bitmap = dst;
+	r->width = w;
+	r->height = h;
+	r->stride = stride;
+
+	if (w > r->cscanline) {
+		r->cscanline = w;
+		r->scanline = (unsigned char*)realloc(r->scanline, w);
+		if (r->scanline == NULL) return;
+	}
+
+	for (i = 0; i < h; i++)
+		memset(&dst[i*stride], 0, w*4);
+
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		NSVGfilter* filter = NULL;
+		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
+			continue;
+
+		if (shape->filter[0] != '\0')
+			filter = nsvg__findFilter(image, shape->filter);
+
+		if (filter == NULL || !filter->hasDisplacement) {
+			nsvg__renderShape(r, shape, tx, ty, scale);
+		} else {
+			// Render the shape on its own, displace it, composite over backdrop.
+			unsigned char* src = (unsigned char*)malloc(h * stride);
+			if (src == NULL) continue;
+			memset(src, 0, h * stride);
+			r->bitmap = src;
+			nsvg__renderShape(r, shape, tx, ty, scale);
+			r->bitmap = dst;
+			nsvg__applyDisplacementMap(r, filter, src, scale);
+			free(src);
+		}
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);

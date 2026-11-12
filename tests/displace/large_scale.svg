@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="120">
+  <defs>
+    <filter id="wave-big">
+      <feFlood flood-color="#ff0080" result="map"/>
+      <feDisplacementMap in="SourceGraphic" in2="map" scale="200" xChannelSelector="R" yChannelSelector="B"/>
+    </filter>
+  </defs>
+  <rect x="0" y="0" width="160" height="120" fill="#223344"/>
+  <rect x="120" y="40" width="30" height="40" fill="#ff8080" filter="url(#wave-big)"/>
+</svg>
