@@ -133,6 +133,39 @@ typedef struct NSVGpaint {
 	};
 } NSVGpaint;
 
+#define NSVG_MAX_FILTER_PRIMS 16
+#define NSVG_MAX_MERGE_NODES 8
+
+enum NSVGcompositeOp {
+	NSVG_COMPOSITE_OVER = 0,
+	NSVG_COMPOSITE_IN,
+	NSVG_COMPOSITE_OUT,
+	NSVG_COMPOSITE_ATOP,
+	NSVG_COMPOSITE_XOR
+};
+
+enum NSVGfilterPrimType {
+	NSVG_FILTER_COMPOSITE = 0,
+	NSVG_FILTER_MERGE
+};
+
+typedef struct NSVGfilterPrim {
+	char type;					// See NSVGfilterPrimType
+	char op;					// Composite operator, see NSVGcompositeOp (feComposite only, defaults to over)
+	char in[64];				// Optional 'in' attr, input result name
+	char in2[64];				// Optional 'in2' attr (feComposite only)
+	char result[64];			// Optional 'result' attr, output name
+	char mergeIn[NSVG_MAX_MERGE_NODES][64];	// feMergeNode 'in' attrs (feMerge only)
+	int nmerge;					// Number of feMergeNode inputs
+} NSVGfilterPrim;
+
+typedef struct NSVGfilter {
+	char id[64];				// 'id' attr of the filter element
+	int nprims;					// Number of filter primitives
+	NSVGfilterPrim prims[NSVG_MAX_FILTER_PRIMS];
+	struct NSVGfilter* next;	// Pointer to next filter, or NULL if last element.
+} NSVGfilter;
+
 typedef struct NSVGpath
 {
 	float* pts;					// Cubic bezier points: x0,y0, [cpx1,cpx1,cpx2,cpy2,x1,y1], ...
@@ -161,6 +194,7 @@ typedef struct NSVGshape
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	char filter[64];			// Optional 'id' of filter
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
@@ -171,6 +205,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGfilter* filters;		// Linked list of filters in the image.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -430,6 +465,7 @@ typedef struct NSVGattrib
 	float strokeOpacity;
 	char fillGradient[64];
 	char strokeGradient[64];
+	char filter[64];
 	float strokeWidth;
 	float strokeDashOffset;
 	float strokeDashArray[NSVG_MAX_DASHES];
@@ -466,6 +502,7 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGfilter* filter;
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -993,6 +1030,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->filter, attr->filter, sizeof shape->filter);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1922,6 +1960,12 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
 		attr->paintOrder = nsvg__parsePaintOrder(value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0) {
+			nsvg__parseUrl(attr->filter, value);
+		} else if (strcmp(value, "none") == 0) {
+			attr->filter[0] = '\0';
+		}
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -2833,9 +2877,99 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseFilter(NSVGparser* p, const char** attr)
+{
+	NSVGfilter* filter;
+	int i;
+
+	filter = (NSVGfilter*)malloc(sizeof(NSVGfilter));
+	if (filter == NULL) return;
+	memset(filter, 0, sizeof(NSVGfilter));
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(filter->id, attr[i + 1], 63);
+			filter->id[63] = '\0';
+		}
+	}
+
+	filter->next = p->image->filters;
+	p->image->filters = filter;
+	p->filter = filter;
+}
+
+static void nsvg__parseFilterPrim(NSVGparser* p, const char** attr, char type)
+{
+	NSVGfilterPrim* prim;
+	int i;
+
+	if (p->filter == NULL) return;
+	if (p->filter->nprims >= NSVG_MAX_FILTER_PRIMS) return;
+
+	prim = &p->filter->prims[p->filter->nprims++];
+	memset(prim, 0, sizeof(NSVGfilterPrim));
+	prim->type = type;
+	prim->op = NSVG_COMPOSITE_OVER;
+
+	for (i = 0; attr[i]; i += 2) {
+		const char* name = attr[i];
+		const char* value = attr[i + 1];
+		if (strcmp(name, "in") == 0) {
+			strncpy(prim->in, value, 63);
+			prim->in[63] = '\0';
+		} else if (strcmp(name, "in2") == 0) {
+			strncpy(prim->in2, value, 63);
+			prim->in2[63] = '\0';
+		} else if (strcmp(name, "result") == 0) {
+			strncpy(prim->result, value, 63);
+			prim->result[63] = '\0';
+		} else if (strcmp(name, "operator") == 0) {
+			if (strcmp(value, "in") == 0) prim->op = NSVG_COMPOSITE_IN;
+			else if (strcmp(value, "out") == 0) prim->op = NSVG_COMPOSITE_OUT;
+			else if (strcmp(value, "atop") == 0) prim->op = NSVG_COMPOSITE_ATOP;
+			else if (strcmp(value, "xor") == 0) prim->op = NSVG_COMPOSITE_XOR;
+			else prim->op = NSVG_COMPOSITE_OVER;
+		}
+	}
+}
+
+static void nsvg__parseMergeNode(NSVGparser* p, const char** attr)
+{
+	NSVGfilterPrim* prim;
+	int i;
+
+	if (p->filter == NULL || p->filter->nprims == 0) return;
+	prim = &p->filter->prims[p->filter->nprims - 1];
+	if (prim->type != NSVG_FILTER_MERGE || prim->nmerge >= NSVG_MAX_MERGE_NODES) return;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "in") == 0) {
+			strncpy(prim->mergeIn[prim->nmerge], attr[i + 1], 63);
+			prim->mergeIn[prim->nmerge][63] = '\0';
+			prim->nmerge++;
+		}
+	}
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
+
+	// Parse filter elements even inside defs.
+	if (strcmp(el, "filter") == 0) {
+		nsvg__parseFilter(p, attr);
+		return;
+	}
+	if (p->filter != NULL) {
+		// Swallow everything inside a filter, only keep the primitives we support.
+		if (strcmp(el, "feComposite") == 0)
+			nsvg__parseFilterPrim(p, attr, NSVG_FILTER_COMPOSITE);
+		else if (strcmp(el, "feMerge") == 0)
+			nsvg__parseFilterPrim(p, attr, NSVG_FILTER_MERGE);
+		else if (strcmp(el, "feMergeNode") == 0)
+			nsvg__parseMergeNode(p, attr);
+		return;
+	}
 
 	if (p->defsFlag) {
 		// Skip everything but gradients and styles in defs
@@ -2911,6 +3045,8 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
+	} else if (strcmp(el, "filter") == 0) {
+		p->filter = NULL;
 	}
 }
 
@@ -3260,6 +3396,7 @@ error:
 void nsvgDelete(NSVGimage* image)
 {
 	NSVGshape *snext, *shape;
+	NSVGfilter *fnext, *filter;
 	if (image == NULL) return;
 	shape = image->shapes;
 	while (shape != NULL) {
@@ -3269,6 +3406,12 @@ void nsvgDelete(NSVGimage* image)
 		nsvg__deletePaint(&shape->stroke);
 		free(shape);
 		shape = snext;
+	}
+	filter = image->filters;
+	while (filter != NULL) {
+		fnext = filter->next;
+		free(filter);
+		filter = fnext;
 	}
 	free(image);
 }
