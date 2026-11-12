@@ -24,6 +24,10 @@ Thumbs.db
 ## Build dir
 build/*
 
+## Specular lighting test binaries
+tests/specular/validate
+tests/specular/validate_asan
+
 ## Stuff in example
 example/_*
 

@@ -85,6 +85,7 @@ void nsvgDeleteRasterizer(NSVGrasterizer*);
 #define NSVG__FIX			(1 << NSVG__FIXSHIFT)
 #define NSVG__FIXMASK		(NSVG__FIX-1)
 #define NSVG__MEMPAGE_SIZE	1024
+#define NSVG__BEVEL_WIDTH	2.0f	// SDF bevel width (px) for lighting normals
 
 typedef struct NSVGedge {
 	float x0,y0, x1,y1;
@@ -1372,6 +1373,286 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
+// Rasterize the fill coverage of a shape into an alpha buffer (0..255).
+static void nsvg__rasterizeCoverage(NSVGrasterizer* r, NSVGshape* shape,
+								   float tx, float ty, float scale,
+								   unsigned char* cover, int cw, int ch)
+{
+	NSVGactiveEdge* active = NULL;
+	int y, s, i, ei, xmin, xmax;
+	int maxWeight = 255 / NSVG__SUBSAMPLES;
+
+	nsvg__resetPool(r);
+	r->freelist = NULL;
+	r->nedges = 0;
+	nsvg__flattenShape(r, shape, scale);
+
+	for (i = 0; i < r->nedges; i++) {
+		r->edges[i].x0 = tx + r->edges[i].x0;
+		r->edges[i].y0 = (ty + r->edges[i].y0) * NSVG__SUBSAMPLES;
+		r->edges[i].x1 = tx + r->edges[i].x1;
+		r->edges[i].y1 = (ty + r->edges[i].y1) * NSVG__SUBSAMPLES;
+	}
+	if (r->nedges != 0)
+		qsort(r->edges, r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
+
+	ei = 0;
+	for (y = 0; y < ch; y++) {
+		memset(r->scanline, 0, cw);
+		xmin = cw;
+		xmax = 0;
+		for (s = 0; s < NSVG__SUBSAMPLES; ++s) {
+			float scany = (float)(y*NSVG__SUBSAMPLES + s) + 0.5f;
+			NSVGactiveEdge** step = &active;
+			while (*step) {
+				NSVGactiveEdge* z = *step;
+				if (z->ey <= scany) {
+					*step = z->next;
+					nsvg__freeActive(r, z);
+				} else {
+					z->x += z->dx;
+					step = &((*step)->next);
+				}
+			}
+			for (;;) {
+				int changed = 0;
+				step = &active;
+				while (*step && (*step)->next) {
+					if ((*step)->x > (*step)->next->x) {
+						NSVGactiveEdge* t2 = *step;
+						NSVGactiveEdge* q = t2->next;
+						t2->next = q->next;
+						q->next = t2;
+						*step = q;
+						changed = 1;
+					}
+					step = &(*step)->next;
+				}
+				if (!changed) break;
+			}
+			while (ei < r->nedges && r->edges[ei].y0 <= scany) {
+				if (r->edges[ei].y1 > scany) {
+					NSVGactiveEdge* z = nsvg__addActive(r, &r->edges[ei], scany);
+					if (z == NULL) break;
+					if (active == NULL) {
+						active = z;
+					} else if (z->x < active->x) {
+						z->next = active;
+						active = z;
+					} else {
+						NSVGactiveEdge* p = active;
+						while (p->next && p->next->x < z->x)
+							p = p->next;
+						z->next = p->next;
+						p->next = z;
+					}
+				}
+				ei++;
+			}
+			if (active != NULL)
+				nsvg__fillActiveEdges(r->scanline, cw, active, maxWeight, &xmin, &xmax, shape->fillRule);
+		}
+		if (xmin < 0) xmin = 0;
+		if (xmax > cw-1) xmax = cw-1;
+		if (xmin <= xmax)
+			memcpy(&cover[y*cw + xmin], &r->scanline[xmin], xmax-xmin+1);
+	}
+}
+
+static float nsvg__normalize3(float* x, float* y, float* z)
+{
+	float len = sqrtf((*x)*(*x) + (*y)*(*y) + (*z)*(*z));
+	if (len > 1e-6f) {
+		*x /= len; *y /= len; *z /= len;
+	} else {
+		*x = 0; *y = 0; *z = 1;
+		len = 1.0f;
+	}
+	return len;
+}
+
+// Build a signed distance field (in pixels) from coverage alpha.
+// Positive values are inside the shape, negative outside. A two-pass
+// 3x3 chamfer transform gives a cheap approximation of the exact EDT.
+static void nsvg__makeSDF(const unsigned char* cover, float* sdf, int w, int h)
+{
+	const float big = 1.0e6f;
+	const float d1 = 1.0f, d2 = 1.41421356f;
+	int x, y;
+
+	for (y = 0; y < h; y++)
+		for (x = 0; x < w; x++)
+			sdf[y*w + x] = cover[y*w + x] >= 128 ? 0.0f : big;
+
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			float d = sdf[y*w + x];
+			if (x > 0)        d = nsvg__minf(d, sdf[y*w + x-1] + d1);
+			if (y > 0) {
+				if (x > 0)      d = nsvg__minf(d, sdf[(y-1)*w + x-1] + d2);
+				d = nsvg__minf(d, sdf[(y-1)*w + x] + d1);
+				if (x < w-1)    d = nsvg__minf(d, sdf[(y-1)*w + x+1] + d2);
+			}
+			sdf[y*w + x] = d;
+		}
+	}
+	for (y = h-1; y >= 0; y--) {
+		for (x = w-1; x >= 0; x--) {
+			float d = sdf[y*w + x];
+			if (x < w-1)      d = nsvg__minf(d, sdf[y*w + x+1] + d1);
+			if (y < h-1) {
+				if (x > 0)      d = nsvg__minf(d, sdf[(y+1)*w + x-1] + d2);
+				d = nsvg__minf(d, sdf[(y+1)*w + x] + d1);
+				if (x < w-1)    d = nsvg__minf(d, sdf[(y+1)*w + x+1] + d2);
+			}
+			sdf[y*w + x] = d;
+		}
+	}
+
+	// Convert the unsigned inside-distance into a signed field. Outside
+	// pixels keep their positive distance but get a negative sign.
+	for (y = 0; y < h; y++)
+		for (x = 0; x < w; x++) {
+			int idx = y*w + x;
+			if (cover[idx] < 128)
+				sdf[idx] = -sdf[idx];
+		}
+}
+
+// Apply feSpecularLighting to one shape and add the highlight over dst.
+static void nsvg__applySpecularLighting(NSVGrasterizer* r, NSVGshape* shape,
+										float tx, float ty, float scale,
+										unsigned char* dst, int w, int h, int stride)
+{
+	NSVGfilter* f = shape->filter;
+	float b[4];
+	int rx0, ry0, rw, rh, x, y;
+	unsigned char* cover;
+	float* sdf;
+	float lx, ly, lz;
+
+	if (f == NULL) return;
+
+	// Filter region in destination pixels: shape bounds expanded by 10%.
+	b[0] = tx + shape->bounds[0]*scale;
+	b[1] = ty + shape->bounds[1]*scale;
+	b[2] = tx + shape->bounds[2]*scale;
+	b[3] = ty + shape->bounds[3]*scale;
+	rx0 = (int)floorf(b[0] - (b[2]-b[0])*0.10f);
+	ry0 = (int)floorf(b[1] - (b[3]-b[1])*0.10f);
+	rw = (int)ceilf((b[2]-b[0])*1.20f) + 2;
+	rh = (int)ceilf((b[3]-b[1])*1.20f) + 2;
+	if (rx0 < 0) { rw += rx0; rx0 = 0; }
+	if (ry0 < 0) { rh += ry0; ry0 = 0; }
+	if (rx0 + rw > w) rw = w - rx0;
+	if (ry0 + rh > h) rh = h - ry0;
+	if (rw <= 0 || rh <= 0) return;
+
+	cover = (unsigned char*)calloc((size_t)rw*rh, 1);
+	if (cover == NULL) return;
+
+	// Use a region-sized scanline while rasterizing coverage, then restore
+	// the main bitmap's scanline buffer for subsequent shape rendering.
+	{
+		unsigned char* savedScanline = r->scanline;
+		int savedCscanline = r->cscanline;
+		r->scanline = (unsigned char*)malloc((size_t)rw);
+		if (r->scanline == NULL) { r->scanline = savedScanline; free(cover); return; }
+		r->cscanline = rw;
+		nsvg__rasterizeCoverage(r, shape, tx-rx0, ty-ry0, scale, cover, rw, rh);
+		free(r->scanline);
+		r->scanline = savedScanline;
+		r->cscanline = savedCscanline;
+	}
+	sdf = (float*)malloc((size_t)rw*rh*sizeof(float));
+	if (sdf == NULL) { free(cover); return; }
+	nsvg__makeSDF(cover, sdf, rw, rh);
+
+	// Light position in region pixel coordinates.
+	// Point-light position in region pixel coordinates. Distant light uses
+	// a constant direction, so lx/ly/lz are left unused for that case.
+	lx = tx + f->lx*scale - rx0;
+	ly = ty + f->ly*scale - ry0;
+	lz = f->lz*scale;
+
+	{
+		unsigned int lr = f->lightingColor & 0xff;
+		unsigned int lg = (f->lightingColor >> 8) & 0xff;
+		unsigned int lb = (f->lightingColor >> 16) & 0xff;
+		float ss = f->surfaceScale * scale;
+
+		for (y = 0; y < rh; y++) {
+			for (x = 0; x < rw; x++) {
+				int a = cover[y*rw + x];
+				float za, zb, zc, zd, nx, ny, nz, len;
+				float vx, vy, vz, dot, reflx, refly, reflz, intensity;
+				unsigned char* out;
+				if (a == 0) continue;
+
+				// Surface normal from the signed distance field: the height
+				// field is the SDF clamped to a finite bevel width, matching
+				// the smoothed alpha that feSpecularLighting differentiates.
+				// The flat interior (bevel plateau) keeps the normal at +z.
+				za = (x > 0)     ? nsvg__clampf(sdf[y*rw + x-1],   0.0f, NSVG__BEVEL_WIDTH) : 0.0f;
+				zb = (x < rw-1)  ? nsvg__clampf(sdf[y*rw + x+1],   0.0f, NSVG__BEVEL_WIDTH) : 0.0f;
+				zc = (y > 0)     ? nsvg__clampf(sdf[(y-1)*rw + x], 0.0f, NSVG__BEVEL_WIDTH) : 0.0f;
+				zd = (y < rh-1)  ? nsvg__clampf(sdf[(y+1)*rw + x], 0.0f, NSVG__BEVEL_WIDTH) : 0.0f;
+				nx = (za - zb) * 0.5f * ss;
+				ny = (zc - zd) * 0.5f * ss;
+				nz = 1.0f;
+				nsvg__normalize3(&nx, &ny, &nz);
+
+				// Incident direction L: from the surface point toward the light.
+				vx = lx - (float)x;
+				vy = ly - (float)y;
+				vz = lz - nsvg__clampf(sdf[y*rw+x], 0.0f, NSVG__BEVEL_WIDTH)*ss;
+				nsvg__normalize3(&vx, &vy, &vz);
+
+				if (f->lightType == NSVG_LIGHT_DISTANT) {
+					float az = f->azimuth * NSVG_PI / 180.0f;
+					float el = f->elevation * NSVG_PI / 180.0f;
+					vx = cosf(el)*cosf(az);
+					vy = cosf(el)*sinf(az);
+					vz = sinf(el);
+				}
+
+				dot = nx*vx + ny*vy + nz*vz;
+				if (dot <= 0.0f) continue;
+				// Reflected light direction R = 2(N.L)N - L.
+				reflx = 2.0f*dot*nx - vx;
+				refly = 2.0f*dot*ny - vy;
+				reflz = 2.0f*dot*nz - vz;
+				nsvg__normalize3(&reflx, &refly, &reflz);
+
+				// SVG +z points toward the viewer, so the eye direction is
+				// (0,0,1); specular intensity follows R . E = R.z.
+				len = reflz;
+				if (len < 0.0f) continue;
+				intensity = f->specularConstant * powf(len, f->specularExponent);
+				if (intensity <= 0.0f) continue;
+				if (intensity > 1.0f) intensity = 1.0f;
+
+				out = &dst[(ry0+y)*stride + (rx0+x)*4];
+				{
+					int sr = (int)(lr * intensity);
+					int sg = (int)(lg * intensity);
+					int sb = (int)(lb * intensity);
+					int sa = (int)((float)a * intensity);
+					int ia = 255 - sa;
+					// Source-over, premultiplied.
+					out[0] = (unsigned char)(sr + nsvg__div255(ia*(int)out[0]));
+					out[1] = (unsigned char)(sg + nsvg__div255(ia*(int)out[1]));
+					out[2] = (unsigned char)(sb + nsvg__div255(ia*(int)out[2]));
+					out[3] = (unsigned char)(sa + nsvg__div255(ia*(int)out[3]));
+				}
+			}
+		}
+	}
+
+	free(sdf);
+	free(cover);
+}
+
 void nsvgRasterize(NSVGrasterizer* r,
 				   NSVGimage* image, float tx, float ty, float scale,
 				   unsigned char* dst, int w, int h, int stride)
@@ -1457,6 +1738,14 @@ void nsvgRasterize(NSVGrasterizer* r,
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
         }
+
+		// Specular lighting is composited on top of the painted shape.
+		if (shape->filter != NULL) {
+			nsvg__applySpecularLighting(r, shape, tx, ty, scale, dst, w, h, stride);
+			nsvg__resetPool(r);
+			r->freelist = NULL;
+			r->nedges = 0;
+		}
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);

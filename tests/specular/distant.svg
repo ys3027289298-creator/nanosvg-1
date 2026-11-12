@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <defs>
+    <filter id="spec" x="-10%" y="-10%" width="120%" height="120%">
+      <feSpecularLighting surfaceScale="3" specularConstant="1" specularExponent="12" lighting-color="white">
+        <feDistantLight azimuth="225" elevation="45"/>
+      </feSpecularLighting>
+    </filter>
+  </defs>
+  <circle cx="16" cy="16" r="11" fill="#3060a0" filter="url(#spec)"/>
+</svg>
