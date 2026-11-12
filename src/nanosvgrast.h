@@ -67,6 +67,12 @@ void nsvgRasterize(NSVGrasterizer* r,
 // Deletes rasterizer context.
 void nsvgDeleteRasterizer(NSVGrasterizer*);
 
+// Converts a single color channel value in [0,1] between sRGB and linear light.
+// Uses the exact IEC 61966-2-1 sRGB transfer function (no gamma approximation),
+// so the only error is float rounding (relative error well below 1e-6).
+float nsvgSRGBToLinear(float c);
+float nsvgLinearToSRGB(float c);
+
 
 #ifndef NANOSVGRAST_CPLUSPLUS
 #ifdef __cplusplus
@@ -146,6 +152,9 @@ struct NSVGrasterizer
 	unsigned char* scanline;
 	int cscanline;
 
+	unsigned char* fbitmap;
+	int cfbitmap;
+
 	unsigned char* bitmap;
 	int width, height, stride;
 };
@@ -183,6 +192,7 @@ void nsvgDeleteRasterizer(NSVGrasterizer* r)
 	if (r->points) free(r->points);
 	if (r->points2) free(r->points2);
 	if (r->scanline) free(r->scanline);
+	if (r->fbitmap) free(r->fbitmap);
 
 	free(r);
 }
@@ -1372,34 +1382,157 @@ static void dumpEdges(NSVGrasterizer* r, const char* name)
 }
 */
 
-void nsvgRasterize(NSVGrasterizer* r,
-				   NSVGimage* image, float tx, float ty, float scale,
-				   unsigned char* dst, int w, int h, int stride)
+float nsvgSRGBToLinear(float c)
 {
-	NSVGshape *shape = NULL;
+	return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+float nsvgLinearToSRGB(float c)
+{
+	return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+
+static NSVGfilter* nsvg__findFilter(NSVGimage* image, const char* id)
+{
+	NSVGfilter* filter;
+	if (id[0] == '\0') return NULL;
+	for (filter = image->filters; filter != NULL; filter = filter->next) {
+		if (strcmp(filter->id, id) == 0)
+			return filter;
+	}
+	return NULL;
+}
+
+// Builds a normalized 1D Gaussian kernel truncated at 3 sigma, returns radius.
+static int nsvg__gaussianKernel(float* kernel, float sigma)
+{
+	int r = (int)ceilf(sigma * 3.0f);
+	float sum = 0.0f;
+	int i;
+	if (r < 1) r = 1;
+	for (i = -r; i <= r; i++) {
+		float v = expf(-0.5f * (float)(i * i) / (sigma * sigma));
+		kernel[i + r] = v;
+		sum += v;
+	}
+	for (i = 0; i <= 2 * r; i++)
+		kernel[i] /= sum;
+	return r;
+}
+
+// Separable Gaussian blur of a premultiplied RGBA bitmap.
+// Returns a malloc'd float buffer (w*h*4 values in [0,1]), or NULL on error.
+// When linearRGB is set, RGB channels are converted to linear light (in float,
+// before any quantization) and the result stays linear; the caller converts
+// back when compositing (SVG 'color-interpolation-filters').
+static float* nsvg__gaussianBlur(const unsigned char* img, int w, int h, int stride, float sx, float sy, int linearRGB)
+{
+	float* bufA = NULL;
+	float* bufB = NULL;
+	float* kernel = NULL;
+	int x, y, c, k, rx, ry;
+
+	bufA = (float*)malloc((size_t)w * h * 4 * sizeof(float));
+	bufB = (float*)malloc((size_t)w * h * 4 * sizeof(float));
+	kernel = (float*)malloc((size_t)(2 * (int)ceilf((sx > sy ? sx : sy) * 3.0f) + 1) * sizeof(float));
+	if (bufA == NULL || bufB == NULL || kernel == NULL) goto error;
+
+	// To float, optionally linearizing RGB.
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			for (c = 0; c < 4; c++) {
+				float v = img[y * stride + x * 4 + c] / 255.0f;
+				if (linearRGB && c < 3) v = nsvgSRGBToLinear(v);
+				bufA[(y * w + x) * 4 + c] = v;
+			}
+		}
+	}
+
+	// Horizontal pass.
+	if (sx > 0.01f) {
+		rx = nsvg__gaussianKernel(kernel, sx);
+		for (y = 0; y < h; y++) {
+			for (x = 0; x < w; x++) {
+				for (c = 0; c < 4; c++) {
+					float sum = 0.0f;
+					for (k = -rx; k <= rx; k++) {
+						int xx = x + k;
+						if (xx < 0) xx = 0;
+						if (xx > w - 1) xx = w - 1;
+						sum += kernel[k + rx] * bufA[(y * w + xx) * 4 + c];
+					}
+					bufB[(y * w + x) * 4 + c] = sum;
+				}
+			}
+		}
+	} else {
+		memcpy(bufB, bufA, (size_t)w * h * 4 * sizeof(float));
+	}
+
+	// Vertical pass.
+	if (sy > 0.01f) {
+		ry = nsvg__gaussianKernel(kernel, sy);
+		for (y = 0; y < h; y++) {
+			for (x = 0; x < w; x++) {
+				for (c = 0; c < 4; c++) {
+					float sum = 0.0f;
+					for (k = -ry; k <= ry; k++) {
+						int yy = y + k;
+						if (yy < 0) yy = 0;
+						if (yy > h - 1) yy = h - 1;
+						sum += kernel[k + ry] * bufB[(yy * w + x) * 4 + c];
+					}
+					bufA[(y * w + x) * 4 + c] = sum;
+				}
+			}
+		}
+	} else {
+		memcpy(bufA, bufB, (size_t)w * h * 4 * sizeof(float));
+	}
+
+	if (bufB) free(bufB);
+	if (kernel) free(kernel);
+	return bufA;
+
+error:
+	if (bufA) free(bufA);
+	if (bufB) free(bufB);
+	if (kernel) free(kernel);
+	return NULL;
+}
+
+// Premultiplied "over" composite of a float RGBA image over an 8-bit one.
+// When linearRGB is set, src is linear and dst is converted to linear light
+// for the blend and converted back afterwards, all in float precision.
+static void nsvg__compositeOver(unsigned char* dst, const float* src, int w, int h, int stride, int linearRGB)
+{
+	int x, y, c;
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			const float* s = &src[(y * w + x) * 4];
+			unsigned char* d = &dst[y * stride + x * 4];
+			float invA = 1.0f - s[3];
+			for (c = 0; c < 4; c++) {
+				float dv = d[c] / 255.0f;
+				float o;
+				if (linearRGB && c < 3) dv = nsvgSRGBToLinear(dv);
+				o = s[c] + dv * invA;
+				if (linearRGB && c < 3) o = nsvgLinearToSRGB(o);
+				if (o < 0.0f) o = 0.0f;
+				if (o > 1.0f) o = 1.0f;
+				d[c] = (unsigned char)(o * 255.0f + 0.5f);
+			}
+		}
+	}
+}
+
+static void nsvg__rasterizeShape(NSVGrasterizer* r, NSVGshape* shape, float tx, float ty, float scale)
+{
 	NSVGedge *e = NULL;
 	NSVGcachedPaint cache;
 	int i;
     int j;
     unsigned char paintOrder;
-
-	r->bitmap = dst;
-	r->width = w;
-	r->height = h;
-	r->stride = stride;
-
-	if (w > r->cscanline) {
-		r->cscanline = w;
-		r->scanline = (unsigned char*)realloc(r->scanline, w);
-		if (r->scanline == NULL) return;
-	}
-
-	for (i = 0; i < h; i++)
-		memset(&dst[i*stride], 0, w*4);
-
-	for (shape = image->shapes; shape != NULL; shape = shape->next) {
-		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
-			continue;
 
         for (j = 0; j < 3; j++) {
             paintOrder = (shape->paintOrder >> (2 * j)) & 0x03;
@@ -1457,6 +1590,64 @@ void nsvgRasterize(NSVGrasterizer* r,
                 nsvg__rasterizeSortedEdges(r, tx,ty,scale, &cache, NSVG_FILLRULE_NONZERO);
             }
         }
+}
+
+void nsvgRasterize(NSVGrasterizer* r,
+				   NSVGimage* image, float tx, float ty, float scale,
+				   unsigned char* dst, int w, int h, int stride)
+{
+	NSVGshape *shape = NULL;
+	int i;
+
+	r->bitmap = dst;
+	r->width = w;
+	r->height = h;
+	r->stride = stride;
+
+	if (w > r->cscanline) {
+		r->cscanline = w;
+		r->scanline = (unsigned char*)realloc(r->scanline, w);
+		if (r->scanline == NULL) return;
+	}
+
+	for (i = 0; i < h; i++)
+		memset(&dst[i*stride], 0, w*4);
+
+	for (shape = image->shapes; shape != NULL; shape = shape->next) {
+		NSVGfilter* filter;
+		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
+			continue;
+
+		filter = nsvg__findFilter(image, shape->filterId);
+		if (filter != NULL && (filter->stdDeviationX > 0.0f || filter->stdDeviationY > 0.0f)) {
+			int linearRGB = filter->colorInterpolation == NSVG_COLOR_INTERPOLATION_LINEAR_RGB;
+			float* fblur;
+			// Render the shape in isolation, blur it, then composite over dst.
+			if (stride * h > r->cfbitmap) {
+				if (r->fbitmap) free(r->fbitmap);
+				r->cfbitmap = stride * h;
+				r->fbitmap = (unsigned char*)malloc(r->cfbitmap);
+				if (r->fbitmap == NULL) {
+					r->cfbitmap = 0;
+					continue;
+				}
+			}
+			memset(r->fbitmap, 0, (size_t)stride * h);
+			r->bitmap = r->fbitmap;
+			nsvg__rasterizeShape(r, shape, tx, ty, scale);
+			r->bitmap = dst;
+			// For linearRGB the filter input is moved to linear light (in
+			// float, before quantization), the blur and the composite happen
+			// there, and the canvas is converted back to sRGB afterwards.
+			fblur = nsvg__gaussianBlur(r->fbitmap, w, h, stride,
+				filter->stdDeviationX * scale, filter->stdDeviationY * scale, linearRGB);
+			if (fblur != NULL) {
+				nsvg__compositeOver(dst, fblur, w, h, stride, linearRGB);
+				free(fblur);
+			}
+		} else {
+			nsvg__rasterizeShape(r, shape, tx, ty, scale);
+		}
 	}
 
 	nsvg__unpremultiplyAlpha(dst, w, h, stride);

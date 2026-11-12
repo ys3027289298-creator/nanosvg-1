@@ -142,6 +142,19 @@ typedef struct NSVGpath
 	struct NSVGpath* next;		// Pointer to next path, or NULL if last element.
 } NSVGpath;
 
+// Color interpolation space used for filter operations (see SVG 'color-interpolation-filters').
+#define NSVG_COLOR_INTERPOLATION_SRGB 0			// Spec default: filter ops in sRGB space.
+#define NSVG_COLOR_INTERPOLATION_LINEAR_RGB 1	// Filter ops in linearized sRGB space.
+
+typedef struct NSVGfilter
+{
+	char id[64];				// Optional 'id' attr of the filter element.
+	float stdDeviationX;		// feGaussianBlur stdDeviation (scaled), x component.
+	float stdDeviationY;		// feGaussianBlur stdDeviation (scaled), y component.
+	char colorInterpolation;	// See NSVG_COLOR_INTERPOLATION_*.
+	struct NSVGfilter* next;	// Pointer to next filter, or NULL if last element.
+} NSVGfilter;
+
 typedef struct NSVGshape
 {
 	char id[64];				// Optional 'id' attr of the shape or its group
@@ -161,6 +174,7 @@ typedef struct NSVGshape
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	char filterId[64];			// Optional 'id' of filter applied to the shape
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
@@ -171,6 +185,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGfilter* filters;		// Linked list of filters in the image.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -446,6 +461,8 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char filterId[64];
+	char colorInterpolationFilters;
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -466,6 +483,9 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGfilter* filters;
+	NSVGfilter* filtersTail;
+	NSVGfilter* curFilter;
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -718,6 +738,11 @@ static void nsvg__deleteParser(NSVGparser* p)
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		while (p->filters != NULL) {
+			NSVGfilter* next = p->filters->next;
+			free(p->filters);
+			p->filters = next;
+		}
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -993,6 +1018,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->filterId, attr->filterId, sizeof shape->filterId);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1922,6 +1948,12 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "paint-order") == 0) {
 		attr->paintOrder = nsvg__parsePaintOrder(value);
+	} else if (strcmp(name, "filter") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->filterId, value);
+	} else if (strcmp(name, "color-interpolation-filters") == 0) {
+		attr->colorInterpolationFilters = (strcmp(value, "linearRGB") == 0)
+			? NSVG_COLOR_INTERPOLATION_LINEAR_RGB : NSVG_COLOR_INTERPOLATION_SRGB;
 	} else if (strcmp(name, "id") == 0) {
 		strncpy(attr->id, value, 63);
 		attr->id[63] = '\0';
@@ -2833,6 +2865,47 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseFilter(NSVGparser* p)
+{
+	NSVGattrib* attr = nsvg__getAttr(p);
+	NSVGfilter* filter = (NSVGfilter*)malloc(sizeof(NSVGfilter));
+	if (filter == NULL) return;
+	memset(filter, 0, sizeof(NSVGfilter));
+
+	memcpy(filter->id, attr->id, sizeof filter->id);
+	filter->colorInterpolation = (char)attr->colorInterpolationFilters;
+
+	if (p->filters == NULL)
+		p->filters = filter;
+	else
+		p->filtersTail->next = filter;
+	p->filtersTail = filter;
+	p->curFilter = filter;
+}
+
+static void nsvg__parseFeGaussianBlur(NSVGparser* p, const char** attr)
+{
+	NSVGfilter* filter = p->curFilter;
+	int i;
+	if (filter == NULL) return;
+
+	// 'color-interpolation-filters' is inherited; the primitive may override it.
+	filter->colorInterpolation = (char)nsvg__getAttr(p)->colorInterpolationFilters;
+
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "stdDeviation") == 0) {
+			char num[64];
+			const char* s = nsvg__parseNumber(attr[i + 1], num, 64);
+			filter->stdDeviationX = (float)nsvg__atof(num);
+			filter->stdDeviationY = filter->stdDeviationX;
+			while (*s && (nsvg__isspace(*s) || *s == ',')) s++;
+			s = nsvg__parseNumber(s, num, 64);
+			if (num[0] != '\0')
+				filter->stdDeviationY = (float)nsvg__atof(num);
+		}
+	}
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
@@ -2845,6 +2918,15 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 			nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 		} else if (strcmp(el, "stop") == 0) {
 			nsvg__parseGradientStop(p, attr);
+		} else if (strcmp(el, "filter") == 0) {
+			nsvg__pushAttr(p);
+			nsvg__parseAttribs(p, attr);
+			nsvg__parseFilter(p);
+		} else if (strcmp(el, "feGaussianBlur") == 0) {
+			nsvg__pushAttr(p);
+			nsvg__parseAttribs(p, attr);
+			nsvg__parseFeGaussianBlur(p, attr);
+			nsvg__popAttr(p);
 		} else if (strcmp(el, "style") == 0) {
 			p->styleFlag = 1;
 		}
@@ -2890,6 +2972,15 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradient(p, attr, NSVG_PAINT_RADIAL_GRADIENT);
 	} else if (strcmp(el, "stop") == 0) {
 		nsvg__parseGradientStop(p, attr);
+	} else if (strcmp(el, "filter") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
+		nsvg__parseFilter(p);
+	} else if (strcmp(el, "feGaussianBlur") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
+		nsvg__parseFeGaussianBlur(p, attr);
+		nsvg__popAttr(p);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
 	} else if (strcmp(el, "svg") == 0) {
@@ -2911,6 +3002,9 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->defsFlag = 0;
 	} else if (strcmp(el, "style") == 0) {
 		p->styleFlag = 0;
+	} else if (strcmp(el, "filter") == 0) {
+		nsvg__popAttr(p);
+		p->curFilter = NULL;
 	}
 }
 
@@ -3138,6 +3232,15 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		for (i = 0; i < shape->strokeDashCount; i++)
 			shape->strokeDashArray[i] *= avgs;
 	}
+
+	// Scale filter primitives to the target units as well.
+	{
+		NSVGfilter* filter;
+		for (filter = p->image->filters; filter != NULL; filter = filter->next) {
+			filter->stdDeviationX *= sx;
+			filter->stdDeviationY *= sy;
+		}
+	}
 }
 
 static void nsvg__createGradients(NSVGparser* p)
@@ -3182,6 +3285,10 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 	p->dpi = dpi;
 
 	nsvg__parseXML(input, nsvg__startElement, nsvg__endElement, nsvg__content, p);
+
+	// Move filters to the image.
+	p->image->filters = p->filters;
+	p->filters = NULL;
 
 	// Create gradients after all definitions have been parsed
 	nsvg__createGradients(p);
@@ -3260,6 +3367,7 @@ error:
 void nsvgDelete(NSVGimage* image)
 {
 	NSVGshape *snext, *shape;
+	NSVGfilter *fnext, *filter;
 	if (image == NULL) return;
 	shape = image->shapes;
 	while (shape != NULL) {
@@ -3269,6 +3377,12 @@ void nsvgDelete(NSVGimage* image)
 		nsvg__deletePaint(&shape->stroke);
 		free(shape);
 		shape = snext;
+	}
+	filter = image->filters;
+	while (filter != NULL) {
+		fnext = filter->next;
+		free(filter);
+		filter = fnext;
 	}
 	free(image);
 }

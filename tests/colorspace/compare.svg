@@ -1,0 +1,19 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="edge" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0" stop-color="#000000"/>
+      <stop offset="0.5" stop-color="#000000"/>
+      <stop offset="0.5" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ffffff"/>
+    </linearGradient>
+    <filter id="blurSRGB" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="4"/>
+    </filter>
+    <filter id="blurLinear" color-interpolation-filters="linearRGB">
+      <feGaussianBlur stdDeviation="4"/>
+    </filter>
+  </defs>
+  <rect width="64" height="64" fill="#808080"/>
+  <rect x="8" y="2" width="48" height="28" fill="url(#edge)" filter="url(#blurSRGB)"/>
+  <rect x="8" y="34" width="48" height="28" fill="url(#edge)" filter="url(#blurLinear)"/>
+</svg>

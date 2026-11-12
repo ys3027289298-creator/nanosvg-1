@@ -1,0 +1,45 @@
+[srgb_blur] output/srgb_blur.png row=32
+  x=24 gray=  7 theory=   8.2 dev= -1.2
+  x=26 gray= 21 theory=  22.6 dev= -1.6
+  x=28 gray= 48 theory=  50.4 dev= -2.4
+  x=30 gray= 90 theory=  92.6 dev= -2.6
+  x=32 gray=140 theory= 142.7 dev= -2.7
+  x=34 gray=187 theory= 189.2 dev= -2.2
+  x=36 gray=222 theory= 223.1 dev= -1.1
+  x=38 gray=242 theory= 242.4 dev= -0.4
+  x=40 gray=251 theory= 251.0 dev= +0.0
+  max|dev|=2.7 tol=4.0 -> PASS
+[linear_blur] output/linear_blur.png row=32
+  x=24 gray= 48 theory=  50.2 dev= -2.2
+  x=26 gray= 81 theory=  83.9 dev= -2.9
+  x=28 gray=121 theory= 122.9 dev= -1.9
+  x=30 gray=160 theory= 162.4 dev= -2.4
+  x=32 gray=196 theory= 197.2 dev= -1.2
+  x=34 gray=223 theory= 223.6 dev= -0.6
+  x=36 gray=240 theory= 240.4 dev= -0.4
+  x=38 gray=249 theory= 249.4 dev= -0.4
+  x=40 gray=253 theory= 253.2 dev= -0.2
+  max|dev|=2.9 tol=4.0 -> PASS
+[compare/sRGB] output/compare.png row=16
+  x=24 gray=  7 theory=   8.2 dev= -1.2
+  x=26 gray= 21 theory=  22.6 dev= -1.6
+  x=28 gray= 48 theory=  50.4 dev= -2.4
+  x=30 gray= 90 theory=  92.6 dev= -2.6
+  x=32 gray=140 theory= 142.7 dev= -2.7
+  x=34 gray=187 theory= 189.2 dev= -2.2
+  x=36 gray=222 theory= 223.1 dev= -1.1
+  x=38 gray=242 theory= 242.4 dev= -0.4
+  x=40 gray=251 theory= 251.0 dev= +0.0
+  max|dev|=2.7 tol=4.0 -> PASS
+[compare/linearRGB] output/compare.png row=48
+  x=24 gray= 48 theory=  50.2 dev= -2.2
+  x=26 gray= 81 theory=  83.9 dev= -2.9
+  x=28 gray=121 theory= 122.9 dev= -1.9
+  x=30 gray=160 theory= 162.4 dev= -2.4
+  x=32 gray=196 theory= 197.2 dev= -1.2
+  x=34 gray=223 theory= 223.6 dev= -0.6
+  x=36 gray=240 theory= 240.4 dev= -0.4
+  x=38 gray=249 theory= 249.4 dev= -0.4
+  x=40 gray=253 theory= 253.2 dev= -0.2
+  max|dev|=2.9 tol=4.0 -> PASS
+[regression] sharp edge max|dev|=0 tol=3 -> PASS
