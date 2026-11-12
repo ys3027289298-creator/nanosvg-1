@@ -142,6 +142,20 @@ typedef struct NSVGpath
 	struct NSVGpath* next;		// Pointer to next path, or NULL if last element.
 } NSVGpath;
 
+enum NSVGclipUnits {
+	NSVG_CLIP_USER_SPACE = 0,
+	NSVG_CLIP_OBJECT_BOUNDING_BOX = 1
+};
+
+typedef struct NSVGclipPath
+{
+	char id[64];				// 'id' attribute of the clipPath
+	char clipRef[64];			// Optional 'clip-path' url of a parent clipPath (nested clips)
+	char units;					// NSVG_CLIP_USER_SPACE or NSVG_CLIP_OBJECT_BOUNDING_BOX
+	NSVGpath* paths;			// Clip geometry, same coordinate space as shape paths
+	struct NSVGclipPath* next;	// Pointer to next clipPath, or NULL if last element.
+} NSVGclipPath;
+
 typedef struct NSVGshape
 {
 	char id[64];				// Optional 'id' attr of the shape or its group
@@ -161,6 +175,7 @@ typedef struct NSVGshape
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	char fillGradient[64];		// Optional 'id' of fill gradient
 	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	char clipPath[64];			// Optional 'id' referenced by 'clip-path', empty when not clipped
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
@@ -171,6 +186,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGclipPath* clips;		// Linked list of clipPath definitions in the image.
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -446,6 +462,7 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char clipPath[64];			// 'id' referenced by the 'clip-path' attribute
 } NSVGattrib;
 
 typedef struct NSVGstyleDeclaration
@@ -466,6 +483,8 @@ typedef struct NSVGparser
 	NSVGimage* image;
 	NSVGstyleDeclaration* styles;
 	NSVGgradientData* gradients;
+	NSVGclipPath* clips;
+	NSVGclipPath* curClip;		// ClipPath whose geometry is being parsed, NULL otherwise
 	NSVGshape* shapesTail;
 	float viewMinx, viewMiny, viewWidth, viewHeight;
 	int alignX, alignY, alignType;
@@ -712,12 +731,24 @@ static void nsvg__deleteGradientData(NSVGgradientData* grad)
 	}
 }
 
+static void nsvg__deleteClips(NSVGclipPath* clip)
+{
+	NSVGclipPath* next;
+	while (clip != NULL) {
+		next = clip->next;
+		nsvg__deletePaths(clip->paths);
+		free(clip);
+		clip = next;
+	}
+}
+
 static void nsvg__deleteParser(NSVGparser* p)
 {
 	if (p != NULL) {
 		nsvg__deleteStyles(p->styles);
 		nsvg__deletePaths(p->plist);
 		nsvg__deleteGradientData(p->gradients);
+		nsvg__deleteClips(p->clips);
 		nsvgDelete(p->image);
 		free(p->pts);
 		free(p);
@@ -986,6 +1017,19 @@ static void nsvg__addShape(NSVGparser* p)
 	if (p->plist == NULL)
 		return;
 
+	if (p->curClip != NULL) {
+		// Geometry inside a clipPath: keep the paths, discard the shape itself.
+		NSVGpath* tail = p->curClip->paths;
+		if (tail == NULL) {
+			p->curClip->paths = p->plist;
+		} else {
+			while (tail->next != NULL) tail = tail->next;
+			tail->next = p->plist;
+		}
+		p->plist = NULL;
+		return;
+	}
+
 	shape = (NSVGshape*)malloc(sizeof(NSVGshape));
 	if (shape == NULL) goto error;
 	memset(shape, 0, sizeof(NSVGshape));
@@ -993,6 +1037,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->id, attr->id, sizeof shape->id);
 	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
 	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	memcpy(shape->clipPath, attr->clipPath, sizeof shape->clipPath);
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1927,6 +1972,9 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 		attr->id[63] = '\0';
 	} else if (strcmp(name, "class") == 0) {
 		nsvg__applyClassStyles(p, value);
+	} else if (strcmp(name, "clip-path") == 0) {
+		if (strncmp(value, "url(", 4) == 0)
+			nsvg__parseUrl(attr->clipPath, value);
 	}
 	else {
 		return 0;
@@ -2833,12 +2881,102 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop->offset = curAttr->stopOffset;
 }
 
+static void nsvg__parseClipChild(NSVGparser* p, const char* el, const char** attr);
+
+static void nsvg__beginClipPath(NSVGparser* p, const char** attr)
+{
+	NSVGclipPath* clip;
+	int i;
+
+	if (p->curClip != NULL)
+		return; // Nested clipPath elements are not valid; ignore.
+
+	clip = (NSVGclipPath*)malloc(sizeof(NSVGclipPath));
+	if (clip == NULL) return;
+	memset(clip, 0, sizeof(NSVGclipPath));
+	clip->units = NSVG_CLIP_USER_SPACE;
+
+	// Inherit the current context (transforms, clip-path reference, ...).
+	nsvg__pushAttr(p);
+	for (i = 0; attr[i]; i += 2) {
+		if (strcmp(attr[i], "id") == 0) {
+			strncpy(clip->id, attr[i+1], 63);
+			clip->id[63] = '\0';
+		} else if (strcmp(attr[i], "clipPathUnits") == 0) {
+			if (strcmp(attr[i+1], "objectBoundingBox") == 0)
+				clip->units = NSVG_CLIP_OBJECT_BOUNDING_BOX;
+		} else {
+			nsvg__parseAttr(p, attr[i], attr[i + 1]);
+		}
+	}
+	// A clip-path on the clipPath itself establishes a nested (intersected) clip.
+	memcpy(clip->clipRef, nsvg__getAttr(p)->clipPath, sizeof clip->clipRef);
+
+	clip->next = p->clips;
+	p->clips = clip;
+	p->curClip = clip;
+}
+
+static void nsvg__endClipPath(NSVGparser* p)
+{
+	if (p->curClip == NULL)
+		return;
+	p->curClip = NULL;
+	nsvg__popAttr(p);
+}
+
+// Parses one geometry element inside a clipPath. The element's own transform
+// is preserved through the normal attribute stack and path baking.
+static void nsvg__parseClipChild(NSVGparser* p, const char* el, const char** attr)
+{
+	if (strcmp(el, "g") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseAttribs(p, attr);
+	} else if (strcmp(el, "path") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parsePath(p, attr);
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "rect") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseRect(p, attr);
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "circle") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseCircle(p, attr);
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "ellipse") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseEllipse(p, attr);
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "line") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parseLine(p, attr);
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "polyline") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parsePoly(p, attr, 0);
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "polygon") == 0) {
+		nsvg__pushAttr(p);
+		nsvg__parsePoly(p, attr, 1);
+		nsvg__popAttr(p);
+	}
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
 	if (p->defsFlag) {
-		// Skip everything but gradients and styles in defs
+		// Skip everything but clip paths, gradients and styles in defs
+		if (strcmp(el, "clipPath") == 0) {
+			nsvg__beginClipPath(p, attr);
+			return;
+		}
+		if (p->curClip != NULL) {
+			nsvg__parseClipChild(p, el, attr);
+			return;
+		}
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
 		} else if (strcmp(el, "radialGradient") == 0) {
@@ -2892,6 +3030,8 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__parseGradientStop(p, attr);
 	} else if (strcmp(el, "defs") == 0) {
 		p->defsFlag = 1;
+	} else if (strcmp(el, "clipPath") == 0) {
+		nsvg__beginClipPath(p, attr);
 	} else if (strcmp(el, "svg") == 0) {
 		nsvg__parseSVG(p, attr);
 	} else if (strcmp(el, "style") == 0) {
@@ -2903,7 +3043,9 @@ static void nsvg__endElement(void* ud, const char* el)
 {
 	NSVGparser* p = (NSVGparser*)ud;
 
-	if (strcmp(el, "g") == 0) {
+	if (strcmp(el, "clipPath") == 0) {
+		nsvg__endClipPath(p);
+	} else if (strcmp(el, "g") == 0) {
 		nsvg__popAttr(p);
 	} else if (strcmp(el, "path") == 0) {
 		p->pathFlag = 0;
@@ -3053,6 +3195,7 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 {
 	NSVGshape* shape;
 	NSVGpath* path;
+	NSVGclipPath* clip;
 	float tx, ty, sx, sy, us, bounds[4], t[6], avgs;
 	int i;
 	float* pt;
@@ -3138,6 +3281,24 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		for (i = 0; i < shape->strokeDashCount; i++)
 			shape->strokeDashArray[i] *= avgs;
 	}
+
+	// Scale clip paths in the same user space. Object bounding box clips keep
+	// their normalized [0,1] coordinates and are mapped at rasterization time.
+	for (clip = p->image->clips; clip != NULL; clip = clip->next) {
+		if (clip->units == NSVG_CLIP_OBJECT_BOUNDING_BOX)
+			continue;
+		for (path = clip->paths; path != NULL; path = path->next) {
+			path->bounds[0] = (path->bounds[0] + tx) * sx;
+			path->bounds[1] = (path->bounds[1] + ty) * sy;
+			path->bounds[2] = (path->bounds[2] + tx) * sx;
+			path->bounds[3] = (path->bounds[3] + ty) * sy;
+			for (i = 0; i < path->npts; i++) {
+				pt = &path->pts[i*2];
+				pt[0] = (pt[0] + tx) * sx;
+				pt[1] = (pt[1] + ty) * sy;
+			}
+		}
+	}
 }
 
 static void nsvg__createGradients(NSVGparser* p)
@@ -3190,6 +3351,8 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 	nsvg__scaleToViewbox(p, units);
 
 	ret = p->image;
+	ret->clips = p->clips;
+	p->clips = NULL;
 	p->image = NULL;
 
 	nsvg__deleteParser(p);
@@ -3270,6 +3433,7 @@ void nsvgDelete(NSVGimage* image)
 		free(shape);
 		shape = snext;
 	}
+	nsvg__deleteClips(image->clips);
 	free(image);
 }
 
